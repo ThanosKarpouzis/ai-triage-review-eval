@@ -1,0 +1,13 @@
+# Nothing fetched or generated is ever committed: data, model answers and caches stay on your machine.
+data/*
+!data/.gitkeep
+data-sample/
+results/*
+!results/.gitkeep
+results-sample/
+kit/*
+!kit/.gitkeep
+__pycache__/
+*.pyc
+.DS_Store
+*.zip

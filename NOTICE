@@ -1,0 +1,7 @@
+ai-triage-review-eval
+Copyright 2026 Thanos Karpouzis
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+No data and no model weights are included. The local classifier's container downloads
+MoritzLaurer/deberta-v3-large-zeroshot-v2.0 (MIT licence) from Hugging Face at build time.

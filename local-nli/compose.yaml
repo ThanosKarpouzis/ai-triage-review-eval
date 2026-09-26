@@ -1,0 +1,33 @@
+# Local, offline zero-shot classifier for the Jev study (Microsoft DeBERTa-v3, adapted by Moritz Laurer, via Hugging Face).
+#
+#   docker compose -f local-nli/compose.yaml build             # the only step that downloads anything
+#   docker compose -f local-nli/compose.yaml run --rm nli --smoke
+#   docker compose -f local-nli/compose.yaml run --rm nli      # full run, resumes if stopped
+#   docker compose -f local-nli/compose.yaml run --rm nli --data-dir kit/<repo>/data --results-dir kit/<repo>/results
+#   docker compose -f local-nli/compose.yaml down --rmi all    # remove the image when done
+name: jev-study-nli
+
+services:
+  nli:
+    build: .
+    image: jev-study-nli:1
+    # Isolation for the scoring run: no network at all, read-only system, no capabilities.
+    # Runs as your own Mac user so it can read the owner-only vault files and write results.
+    # Set with: export HOST_UID=$(id -u) HOST_GID=$(id -g)   (defaults are the first macOS account)
+    user: "${HOST_UID:-501}:${HOST_GID:-20}"
+    network_mode: none
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 4g
+    # Capped after the Mac restarted during a long run: leaves the laptop half its cores. Slower, gentler.
+    cpus: 4
+    environment:
+      NLI_THREADS: "4"
+    # It sees only the harness folder, read-only, and may write only to harness/results and harness/kit.
+    volumes:
+      - ..:/harness:ro
+      - ../results:/harness/results
+      - ../kit:/harness/kit
