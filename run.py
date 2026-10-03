@@ -25,6 +25,7 @@ PAUSE_BETWEEN_CALLS_S = float(os.environ.get("JEV_STUDY_PAUSE", 0.3))
 # List prices per million tokens, used when the gateway does not report a cost itself.
 PRICES = {
     "typesafe-ai/jev": {"in": 0.042, "out": 0.0},
+    "typesafe-ai/jev#checks": {"in": 0.042, "out": 0.0},
     "anthropic/claude-haiku-4.5": {"in": 1.00, "out": 5.00},
     "anthropic/claude-opus-5.5": {"in": 4.00, "out": 20.00},
     "anthropic/claude-opus-5": {"in": 5.00, "out": 25.00},
@@ -88,6 +89,50 @@ def jev_parse(item, resp):
     return label, max(p, 1 - p), {"yes": p, "no": 1 - p}
 
 
+# ---------------------------------------------------------------------------
+# Decomposition test, pre-registered 3 October 2026 before any call (see README.md).
+# Six narrow yes/no checks asked of Jev in one request per change; their probabilities are combined by a
+# logistic regression fitted on the calibration split (combine_checks.py). Code review tasks only.
+# ---------------------------------------------------------------------------
+CHECKS = {
+    "bug_risk": ("Could this change introduce a bug or break existing behaviour?",
+                 {"true": "The change contains logic that looks wrong or risky, or is likely to break something that worked before.",
+                  "false": "Nothing in the change looks likely to introduce a bug."}),
+    "missing_handling": ("Is this change missing error handling, validation or edge-case handling that it needs?",
+                 {"true": "The change has code that can fail or receive unexpected input without handling it.",
+                  "false": "Failures and unusual inputs are handled, or the change has none."}),
+    "clarity": ("Is any part of this change hard to understand?",
+                 {"true": "It has unclear names, confusing logic, or no explanation where a reader would need one.",
+                  "false": "The change is easy to follow."}),
+    "convention": ("Does this change depart from the code's usual style or conventions?",
+                 {"true": "Its formatting, naming or idioms differ from the surrounding code or the norms of the language.",
+                  "false": "It follows the surrounding style."}),
+    "tests": ("Does this change alter behaviour without adding or updating tests?",
+                 {"true": "Behaviour changes and no test is added or updated.",
+                  "false": "It adds or updates tests, or does not change behaviour."}),
+    "trivial": ("Is this a trivial, low-risk change?",
+                 {"true": "A typo or comment fix, version bump, rename, formatting or similar change with no effect on behaviour.",
+                  "false": "It changes behaviour or logic."}),
+}
+CHECK_TASKS = {"needs_comment", "pr_needs_changes"}
+
+
+def jev_checks_request(item):
+    if item["task"] not in CHECK_TASKS:
+        raise ValueError("the decomposition checks apply to code review tasks only")
+    order = os.environ.get("JEV_PROVIDER_ORDER", "digitalocean,typesafe-ai").split(",")
+    qs = {k: {"type": "boolean", "instructions": ins, "criteria": crit} for k, (ins, crit) in CHECKS.items()}
+    return "/v1/evaluate", {"model": "typesafe-ai/jev", "state": item["text"], "questions": qs,
+                            "providerOptions": {"gateway": {"order": order}}}
+
+
+def jev_checks_parse(item, resp):
+    ans = resp["answers"]
+    probs = {k: float(ans[k].get("probability", ans[k].get("noul"))) for k in CHECKS}
+    # Placeholder label only; the combined decision comes from combine_checks.py.
+    return None, None, probs
+
+
 def haiku_request(item, model_id="anthropic/claude-haiku-4.5"):
     Q = QUESTIONS[item["task"]]
     subject = Q["subject"]
@@ -134,7 +179,13 @@ MODELS = {
     # Exploratory arm, added 26 September 2026 after the Haiku results: same prompt, stronger model, on a sample.
     # Reasoning is switched off so Opus answers like Haiku (Haiku 4.5 does not reason unless asked).
     "opus": {"id": OPUS_MODEL, "request": lambda item: opus_request(item), "parse": haiku_parse},
+    # Decomposition test (3 October 2026): raw check probabilities, kept in results/checks/ so analyze.py ignores them.
+    "jev_checks": {"id": "typesafe-ai/jev#checks", "request": jev_checks_request, "parse": jev_checks_parse},
 }
+
+
+def result_path(model):
+    return RESULTS / "checks" / f"{model}.jsonl" if model == "jev_checks" else RESULTS / f"{model}.jsonl"
 
 
 def cost_of(model_id, resp):
@@ -221,7 +272,7 @@ RETRY_ERRORS = False
 
 
 def done_ids(model):
-    f = RESULTS / f"{model}.jsonl"
+    f = result_path(model)
     if not f.exists():
         return set(), 0.0
     ids, spend = set(), 0.0
@@ -262,9 +313,10 @@ def run(models, tasks, smoke):
     for m in models:
         spec = MODELS[m]
         ids, _ = done_ids(m)
-        todo = [i for i in items if i["id"] not in ids]
+        todo = [i for i in items if i["id"] not in ids and (m != "jev_checks" or i["task"] in CHECK_TASKS)]
         print(f"\n{m}: {len(todo)} to do ({len(ids)} already done)", flush=True)
-        out = (RESULTS / f"{m}.jsonl").open("a", encoding="utf-8")
+        result_path(m).parent.mkdir(parents=True, exist_ok=True)
+        out = result_path(m).open("a", encoding="utf-8")
         for n, item in enumerate(todo, 1):
             if spend >= SPEND_CAP_USD:
                 print(f"Spend cap of ${SPEND_CAP_USD:.2f} reached, stopping.")
@@ -308,7 +360,7 @@ if __name__ == "__main__":
     ap.add_argument("--patient", action="store_true", help="never give up on rate limits; for leaving Jev running overnight")
     ap.add_argument("--data-dir", default="data", help="folder with the task files, relative to this script (default: data)")
     ap.add_argument("--results-dir", default="results", help="where results go, relative to this script (default: results)")
-    ap.add_argument("--model", choices=["jev", "haiku", "opus", "all"], default="all", help="all = jev and haiku")
+    ap.add_argument("--model", choices=["jev", "haiku", "opus", "jev_checks", "all"], default="all", help="all = jev and haiku; jev_checks = the decomposition test")
     ap.add_argument("--task", choices=list(TASKS) + ["all"], default="all")
     a = ap.parse_args()
     RETRY_ERRORS = a.retry_errors

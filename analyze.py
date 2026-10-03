@@ -36,7 +36,7 @@ PUBLISHED = {
     "needs_comment": "CodeReviewer (Li et al. 2022): accuracy 73.9%, F1 71.5.",
 }
 LABELS = {"issue_type": ["bug", "feature", "question"], "needs_comment": ["yes", "no"], "pr_needs_changes": ["yes", "no"]}
-NAMES = {"typesafe-ai/jev": "Jev", "anthropic/claude-haiku-4.5": "Claude Haiku 4.5", "anthropic/claude-opus-5.5": "Claude Opus 5.5",
+NAMES = {"typesafe-ai/jev (decomposed)": "Jev, six narrow checks combined", "typesafe-ai/jev": "Jev", "anthropic/claude-haiku-4.5": "Claude Haiku 4.5", "anthropic/claude-opus-5.5": "Claude Opus 5.5",
          "anthropic/claude-opus-5": "Claude Opus 5", "anthropic/claude-opus-4.7": "Claude Opus 4.7",
          "moritzlaurer/deberta-v3-large-zeroshot-v2.0": "DeBERTa-v3 zero-shot (open, local)"}
 TASK_NAMES = {"issue_type": "Issue triage (bug / feature / question)",

@@ -40,7 +40,7 @@ for name, rows in [("issues.jsonl", s_issues), ("code_review.jsonl", s_reviews)]
 ids = {r["id"] for r in s_issues + s_reviews}
 res = HERE / "results-sample"
 res.mkdir(exist_ok=True)
-for model in ["haiku", "nli"]:
+for model in ["haiku", "nli", "jev"]:
     src = HERE / "results" / f"{model}.jsonl"
     if src.exists():
         kept = [l for l in src.open(encoding="utf-8") if json.loads(l)["id"] in ids]

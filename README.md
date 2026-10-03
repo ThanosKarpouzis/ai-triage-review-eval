@@ -15,7 +15,7 @@ The result is not only accuracy. For each model it reports how many decisions co
 
 A model earns a lane only if its confidence separates the calls it gets right from the ones it gets wrong. The confidence threshold is chosen on one part of your data (the calibration split) and scored on another it has never seen (the evaluation split).
 
-The write-up behind this kit, with results on hashicorp/terraform and two public benchmarks, is here: [link to post].
+The write-up behind this kit, with results on hashicorp/terraform and two public benchmarks, is in two posts: [How much of triage and code review can you hand to AI?](https://thanoskarpouzis.com/writing/2026/delegating-triage-and-review-to-ai/) and [Can a cheap decision model take triage off your team's plate?](https://thanoskarpouzis.com/writing/2026/decision-model-triage-and-review/).
 
 ## What you need
 
@@ -41,7 +41,7 @@ Then pick which labels mean bug, feature and question. Names are case-insensitiv
 python3 fetch_repo.py OWNER/REPO --bug "bug" --feature "enhancement,feature request" --question "question"
 ```
 
-This keeps up to 600 issues and 400 merged pull requests created since 1 January 2026 (change with `--since`), so no model has seen them in training. It writes them to `kit/OWNER__REPO/data`, with a `manifest.json` recording what was kept and why the rest was skipped. Reviews and diffs are cached in `kit/OWNER__REPO/cache` as they arrive, so if the fetch stops, running the same command again carries on. Check the manifest before trusting any number: if your team rarely labels issues or rarely leaves review comments, there is not much ground truth to measure against.
+This keeps up to 600 issues and 400 merged pull requests created since 1 January 2026 (change with `--since`), so the models you test are unlikely to have seen them in training. It writes them to `kit/OWNER__REPO/data`, with a `manifest.json` recording what was kept and why the rest was skipped. Reviews and diffs are cached in `kit/OWNER__REPO/cache` as they arrive, so if the fetch stops, running the same command again carries on. Check the manifest before trusting any number: if your team rarely labels issues or rarely leaves review comments, there is not much ground truth to measure against.
 
 **2. Run the models.**
 
@@ -54,6 +54,8 @@ python3 run.py --model haiku --data-dir kit/OWNER__REPO/data --results-dir kit/O
 The smoke test sends three items per task, to check access. The full run is safe to stop and restart; it resumes where it stopped. On hashicorp/terraform (603 items), Claude Haiku 4.5 took about 20 minutes and cost $1.30. Each results folder has a $4.50 spend cap, set in `run.py`.
 
 Other models: `--model opus` runs Claude Opus with the same prompt (set `OPUS_MODEL`, for example `anthropic/claude-opus-4.7`, to the version your account can use). `--model jev` runs TypeSafe's Jev decision model; add `--patient` to keep waiting when it is at capacity.
+
+Narrow checks, for code review only: `--model jev_checks` asks Jev six narrow yes/no checks about each change in one request (the wording is in `run.py`, `CHECKS`). Then `python3 combine_checks.py --results-dir kit/OWNER__REPO/results` combines them with a small logistic regression fitted on the calibration split, cross-validated so the threshold is not chosen on the same items, and writes `jev-decomposed.jsonl`, which `analyze.py` scores like any other model. It also reports a "safe to skip review" lane: the largest share of changes, starting from the least likely to draw a comment, that stays within 5% on the calibration split, and how that holds on new data. With few commented pull requests to learn from (fewer than about 50), expect the combined model to say "no comment" almost every time.
 
 **3. Optionally, the local classifier.** An open zero-shot classifier, [DeBERTa-v3-large zeroshot v2.0](https://huggingface.co/MoritzLaurer/deberta-v3-large-zeroshot-v2.0) by Moritz Laurer (MIT licence), runs in Docker on your CPU:
 
@@ -97,6 +99,14 @@ The ground truth is only as good as your team's habits. An approved pull request
 ## Data and privacy
 
 Nothing fetched or generated is committed: `.gitignore` keeps `data`, `results`, `kit` and the samples on your machine. If you publish results from someone else's repository, report aggregate numbers only and do not name issue authors or reviewers; GitHub's [Acceptable Use Policies](https://docs.github.com/en/site-policy/acceptable-use-policies/github-acceptable-use-policies) allow research use of public data when the resulting publication is open access. Pull-request diffs and issue text are sent to whichever model provider you run; use the local classifier if that is not acceptable for your code.
+
+## Contributing
+
+This is a reference kit that goes with a write-up, not a maintained project, so issues and pull requests are switched off. Fork it freely and adapt it to your own team; the licence allows that without asking.
+
+## Credits
+
+Written by Thanos Karpouzis with help from Claude (Anthropic), which drafted much of the code and documentation.
 
 ## Licence
 
