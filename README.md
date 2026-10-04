@@ -17,6 +17,8 @@ A model earns a lane only if its confidence separates the calls it gets right fr
 
 The write-up behind this kit, with results on hashicorp/terraform and two public benchmarks, is in two posts: [How much of triage and code review can you hand to AI?](https://thanoskarpouzis.com/writing/2026/delegating-triage-and-review-to-ai/) and [Can a cheap decision model take triage off your team's plate?](https://thanoskarpouzis.com/writing/2026/decision-model-triage-and-review/).
 
+A third study, the [taxonomy test](#test-your-own-labels), asks a different question: does giving a model your team's own labels help, and which triage decisions (type, owning team, priority) can a model take on at all? It is written up in [Is it the model or your labels?](https://thanoskarpouzis.com/writing/2026/model-or-labels/).
+
 ## What you need
 
 - Python 3. The scripts use the standard library only, so there is nothing to install.
@@ -41,7 +43,7 @@ Then pick which labels mean bug, feature and question. Names are case-insensitiv
 python3 fetch_repo.py OWNER/REPO --bug "bug" --feature "enhancement,feature request" --question "question"
 ```
 
-This keeps up to 600 issues and 400 merged pull requests created since 1 January 2026 (change with `--since`), so the models you test are unlikely to have seen them in training. It writes them to `kit/OWNER__REPO/data`, with a `manifest.json` recording what was kept and why the rest was skipped. Reviews and diffs are cached in `kit/OWNER__REPO/cache` as they arrive, so if the fetch stops, running the same command again carries on. Check the manifest before trusting any number: if your team rarely labels issues or rarely leaves review comments, there is not much ground truth to measure against.
+This keeps up to 600 issues and 400 merged pull requests created since 1 January 2026 (change with `--since`), so the models you test are unlikely to have seen them in training. It writes them to `kit/OWNER__REPO/data`, with a `manifest.json` recording what was kept and why the rest was skipped. Every answer from GitHub is kept in `kit/OWNER__REPO/cache` as it arrives, so if the fetch stops, running the same command again carries on, and re-deriving the data later makes no API calls at all. Add `--refresh` to fetch fresh data on purpose; the manifest records when the answers used were fetched. Check the manifest before trusting any number: if your team rarely labels issues or rarely leaves review comments, there is not much ground truth to measure against.
 
 **2. Run the models.**
 
@@ -51,7 +53,7 @@ python3 run.py --model haiku --data-dir kit/OWNER__REPO/data --results-dir kit/O
 python3 run.py --model haiku --data-dir kit/OWNER__REPO/data --results-dir kit/OWNER__REPO/results
 ```
 
-The smoke test sends three items per task, to check access. The full run is safe to stop and restart; it resumes where it stopped. On hashicorp/terraform (603 items), Claude Haiku 4.5 took about 20 minutes and cost $1.30. Each results folder has a $4.50 spend cap, set in `run.py`.
+The smoke test sends three items per task, to check access. The full run is safe to stop and restart; it resumes where it stopped. On hashicorp/terraform (603 items), Claude Haiku 4.5 took about 20 minutes and cost $1.30. Each results folder has a spend cap, $4.50 by default; raise it with `--spend-cap`. The cap counts what is already in the folder, and each running process counts only its own new spending, so allow for that when running several models at once.
 
 Other models: `--model opus` runs Claude Opus with the same prompt (set `OPUS_MODEL`, for example `anthropic/claude-opus-4.7`, to the version your account can use). `--model jev` runs TypeSafe's Jev decision model; add `--patient` to keep waiting when it is at capacity.
 
@@ -74,6 +76,42 @@ python3 analyze.py --results-dir kit/OWNER__REPO/results
 ```
 
 This prints a table per decision and writes `summary.md` and `summary.json` into the results folder: accuracy, macro F1, the three lanes, the actual error in the no-human lane, calibration error, cost per 1,000 decisions and latency. For pull requests it also shows how often reviewers actually commented, and so how well a rule that always answers "no comment" would do. Beating that rule is the first bar.
+
+## Test your own labels
+
+The taxonomy test asks the same models two ways about the same issues: the generic question above (bug, feature or question), and one question per label group in your repository (for example type, team and priority), whose options are your own labels, each described by its GitHub label description as written. The gap shows what your labels add, and the per-group results show which triage decisions a model can take on.
+
+**1. Write a config.** Name each label group by its prefix, say which type labels mean bug, feature and question, and list any label that marks an issue as not yet triaged. [`examples/metabase-taxonomy-config.json`](examples/metabase-taxonomy-config.json) is the one used in the write-up; copy it and adapt it.
+
+**2. Check who sets your labels.** Many busy projects now let a bot label new issues, so a label may be another model's output rather than a person's judgement. The fetch reads each issue's label history, about one API call per issue, and records only whether the reporter, a bot or another person applied each label, never a username. If your bot marks what it touched and people remove the mark when they review (as Metabase's ".Auto triaged" label works), set `"gold": "confirmed"` and `"review_marker"` in the config: only labels a person set, or left in place when they removed the marker, then count as ground truth.
+
+**3. Fetch, run, analyse.**
+
+```sh
+python3 fetch_taxonomy.py OWNER/REPO --config my-taxonomy-config.json --max-issues 3000
+python3 run.py --data-dir kit/OWNER__REPO/data --results-dir kit/OWNER__REPO/results --smoke --spend-cap 8
+python3 run.py --data-dir kit/OWNER__REPO/data --results-dir kit/OWNER__REPO/results --model haiku --spend-cap 8
+python3 run.py --data-dir kit/OWNER__REPO/data --results-dir kit/OWNER__REPO/results --model jev --patient --spend-cap 8
+python3 analyze_taxonomy.py --results-dir kit/OWNER__REPO/results --data-dir kit/OWNER__REPO/data
+```
+
+`run.py` adds the own-label questions automatically when the data folder has a `taxonomy.json`. The analysis compares the two ways of asking on the same issues, with a paired bootstrap interval, splits the results by how each correct label got there, and, where a bot's labels were reviewed, shows how often the reviewer kept them. To score against every label as it stands as well, derive a second data folder from the local copy at no API cost with `--gold all --out data-all`, run the models on it (answers already given are reused) and analyse it with `--data-dir kit/OWNER__REPO/data-all`. On Metabase, about 1,500 issues and four questions each cost about $5 with Claude Haiku 4.5 and a few cents with Jev.
+
+**4. Optional follow-ups.** Two ways to bring in what a label list does not say, both defined in the config:
+
+- **Area, then team.** Add an `"area"` block naming your top-level area label groups. `--model jev_area` asks Jev only which product area an issue concerns, and `combine_taxonomy.py` learns from the calibration split which areas each team owns.
+- **A checklist for priority.** Add `"checks"` with yes/no questions taken from your priority definitions. `--model jev_checks` asks them, and `combine_taxonomy.py` combines them with a small logistic regression fitted on the calibration split.
+
+```sh
+python3 run.py --data-dir kit/OWNER__REPO/data --results-dir kit/OWNER__REPO/results --model jev_area --task own_team --patient
+python3 run.py --data-dir kit/OWNER__REPO/data --results-dir kit/OWNER__REPO/results --model jev_checks --task own_priority --patient
+python3 combine_taxonomy.py --results-dir kit/OWNER__REPO/results --data-dir kit/OWNER__REPO/data
+python3 explore_taxonomy.py --results-dir kit/OWNER__REPO/results --data-dir kit/OWNER__REPO/data --cutoff 2026-05-01
+```
+
+`analyze_taxonomy.py` then scores the combined results like any other model. `explore_taxonomy.py` adds two checks that matter before you rely on a learned mapping: simple baselines (always the most common label, and the same mapping built from area labels already on your issues) and a time split, fitted on earlier issues and tested on later ones. In the write-up, the area-then-team result held on later issues but shrank, because teams were reorganised during the year: relearn the mapping when your teams change.
+
+Rules for the taxonomy test, fixed before results: label descriptions are used exactly as written, and a label without one is described by its name; every label in a group is offered, deprecated ones included; an issue enters a group only if it carries exactly one label of that group; splits are per issue, about 30% calibration, stratified by type, with a fixed seed. The time split and the baselines in `explore_taxonomy.py` were added after the write-up's results and are exploratory.
 
 ## Reproduce the public benchmarks
 
@@ -98,7 +136,7 @@ The ground truth is only as good as your team's habits. An approved pull request
 
 ## Data and privacy
 
-Nothing fetched or generated is committed: `.gitignore` keeps `data`, `results`, `kit` and the samples on your machine. If you publish results from someone else's repository, report aggregate numbers only and do not name issue authors or reviewers; GitHub's [Acceptable Use Policies](https://docs.github.com/en/site-policy/acceptable-use-policies/github-acceptable-use-policies) allow research use of public data when the resulting publication is open access. Pull-request diffs and issue text are sent to whichever model provider you run; use the local classifier if that is not acceptable for your code.
+Nothing fetched or generated is committed: `.gitignore` keeps `data`, `results`, `kit` (including the local copy of GitHub's answers) and the samples on your machine. Label histories record who applied a label only as the reporter, a bot or another person. If you publish results from someone else's repository, report aggregate numbers only and do not name issue authors or reviewers; GitHub's [Acceptable Use Policies](https://docs.github.com/en/site-policy/acceptable-use-policies/github-acceptable-use-policies) allow research use of public data when the resulting publication is open access. Pull-request diffs and issue text are sent to whichever model provider you run; use the local classifier if that is not acceptable for your code.
 
 ## Contributing
 

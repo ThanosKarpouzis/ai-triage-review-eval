@@ -46,33 +46,50 @@ def clean_issue(title, body):
 
 
 class GitHub:
-    def __init__(self, token=None, cache_dir=None):
-        self.token, self.calls, self.cached = token, 0, 0
+    """GitHub REST client that keeps a local copy of every answer (since 3 October 2026; before that, only
+    pull-request reviews and diffs were kept). A later run with the same request reads the copy from disk and
+    makes no API call, so data can be re-derived without asking GitHub again. refresh=True asks GitHub again and
+    overwrites the copies; the manifest records when the oldest and newest answers used were fetched."""
+
+    def __init__(self, token=None, cache_dir=None, refresh=False):
+        self.token, self.calls, self.cached, self.refresh = token, 0, 0, refresh
         self.cache_dir = cache_dir
+        self.fetched_at = []  # when each answer used in this run was fetched from GitHub
+        self.last_from_disk = False
         if cache_dir:
             cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def get(self, path, params=None, accept="application/vnd.github+json", raw=False, cache=False):
-        """cache=True: keep the answer on disk and reuse it on any later run (used for per-pull-request
-        reviews and diffs, which do not change once a pull request is merged). Errors are cached too."""
+    def snapshot(self):
+        known = sorted(t for t in self.fetched_at if t)
+        return {"oldest_answer": known[0] if known else None, "newest_answer": known[-1] if known else None,
+                "answers_from_local_copy": self.cached, "answers_from_github": self.calls}
+
+    def get(self, path, params=None, accept="application/vnd.github+json", raw=False, cache=True):
+        """Every answer is kept on disk and reused on later runs (cache=False opts out). Errors that will not
+        change (404, 406, 410, 422) are kept too."""
         url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
         cfile = None
         if cache and self.cache_dir:
             cfile = self.cache_dir / (hashlib.sha256(f"{accept} {url}".encode()).hexdigest()[:32] + ".json")
-            if cfile.exists():
+            if cfile.exists() and not self.refresh:
                 self.cached += 1
+                self.last_from_disk = True
                 hit = json.loads(cfile.read_text(encoding="utf-8"))
+                self.fetched_at.append(hit.get("fetched"))
                 if "error" in hit:
                     raise urllib.error.HTTPError(url, hit["error"], "cached error", None, None)
                 return hit["body"] if raw else json.loads(hit["body"])
+        self.last_from_disk = False
+        now = time.strftime("%Y-%m-%dT%H:%M:%S")
         try:
             body = self._fetch(url, accept)
         except urllib.error.HTTPError as e:
             if cfile and e.code in (404, 406, 410, 422):
-                cfile.write_text(json.dumps({"error": e.code}), encoding="utf-8")
+                cfile.write_text(json.dumps({"error": e.code, "fetched": now, "url": url}), encoding="utf-8")
             raise
+        self.fetched_at.append(now)
         if cfile:
-            cfile.write_text(json.dumps({"body": body}), encoding="utf-8")
+            cfile.write_text(json.dumps({"body": body, "fetched": now, "url": url}), encoding="utf-8")
         return body if raw else json.loads(body)
 
     def _fetch(self, url, accept):
@@ -99,12 +116,14 @@ class GitHub:
                 time.sleep(2 ** attempt)
         raise SystemExit(f"GitHub kept failing for {url}; try again later")
 
-    def pages(self, path, params, max_pages, cache=False):
+    def pages(self, path, params, max_pages, cache=True):
         for page in range(1, max_pages + 1):
             batch = self.get(path, dict(params, per_page=100, page=page), cache=cache)
             if not batch:
                 return
             yield from batch
+            if len(batch) < 100:
+                return  # a short page is the last one; saves one empty request per list (3 October 2026)
 
 
 def list_labels(gh, repo):
@@ -210,12 +229,13 @@ def main():
     ap.add_argument("--calib-share", type=float, default=0.3)
     ap.add_argument("--skip-prs", action="store_true")
     ap.add_argument("--skip-issues", action="store_true")
+    ap.add_argument("--refresh", action="store_true", help="ask GitHub again instead of reusing the local copy of earlier answers")
     ap.add_argument("--max-diff-chars", type=int, default=DIFF_CAP,
                     help=f"exclude pull requests whose diff is longer (default {DIFF_CAP}); larger values keep more of the changes reviewers discuss")
     a = ap.parse_args()
 
     slug = a.repo.replace("/", "__")
-    gh = GitHub(os.environ.get("GITHUB_TOKEN"), HERE / "kit" / slug / "cache")
+    gh = GitHub(os.environ.get("GITHUB_TOKEN"), HERE / "kit" / slug / "cache", refresh=a.refresh)
     if not gh.token:
         print("No GITHUB_TOKEN set: GitHub allows only 60 requests an hour without one, which is too few for pull requests.")
     if a.list_labels:
@@ -259,6 +279,7 @@ def main():
         print(f"  kept {len(rows)} pull requests: {manifest['prs']['kept']}")
     manifest["api_calls"] = gh.calls
     manifest["answers_reused_from_disk"] = gh.cached
+    manifest["snapshot"] = gh.snapshot()
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     print(f"\nWrote {out_dir.relative_to(HERE)} ({gh.calls} GitHub API calls). Next:\n"
           f"  python3 run.py --data-dir kit/{slug}/data --results-dir kit/{slug}/results --smoke")

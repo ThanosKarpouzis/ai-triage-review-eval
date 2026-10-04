@@ -1,0 +1,99 @@
+{
+  "families": {
+    "type": {
+      "prefix": "Type:"
+    },
+    "team": {
+      "prefix": ".Team/"
+    },
+    "priority": {
+      "prefix": "Priority:",
+      "ordinal": true
+    }
+  },
+  "type_family": "type",
+  "routing_family": "team",
+  "generic_map": {
+    "Type:Bug": "bug",
+    "Type:New Feature": "feature",
+    "Type:Question": "question"
+  },
+  "exclude_labels": [
+    ".Needs Triage"
+  ],
+  "gold": "confirmed",
+  "review_marker": ".Auto triaged",
+  "checks": {
+    "priority": {
+      "security": [
+        "Does this issue describe a security hole?",
+        "It describes a vulnerability, or a way to reach data or functions without permission.",
+        "It does not describe a security problem."
+      ],
+      "regression": [
+        "Does this issue describe a regression: something that used to work and is now broken?",
+        "Behaviour that worked in an earlier version is now broken.",
+        "Nothing indicates that it worked before."
+      ],
+      "crash": [
+        "Does this issue describe a crash?",
+        "The application, a page or a process crashes, freezes or fails completely.",
+        "No crash or complete failure is described."
+      ],
+      "setup_login": [
+        "Does this issue affect setup, upgrades or logging in?",
+        "Installing, setting up, upgrading or signing in is blocked or broken.",
+        "Setup, upgrades and login are not affected."
+      ],
+      "common_feature": [
+        "Does this issue break a commonly used feature?",
+        "A feature that many users rely on regularly does not work.",
+        "Only a rarely used or niche feature is affected, or nothing is broken."
+      ],
+      "correctness": [
+        "Does this issue describe wrong results?",
+        "The product shows or returns incorrect data, numbers or results.",
+        "Results are not wrong; the problem is elsewhere."
+      ],
+      "cosmetic": [
+        "Is this a cosmetic problem only?",
+        "The problem is only about appearance, layout, wording or styling.",
+        "The problem affects behaviour or results, not only appearance."
+      ],
+      "workaround": [
+        "Does this issue have a clear workaround?",
+        "The issue mentions, or it is obvious, that users can get around the problem easily.",
+        "No clear workaround is available or mentioned."
+      ],
+      "minor": [
+        "Is this a minor problem?",
+        "It is an annoyance with limited impact on users.",
+        "It has a significant impact on users."
+      ]
+    }
+  },
+  "area": {
+    "for_family": "team",
+    "instructions": "Which product area of this repository does this GitHub issue concern?",
+    "families": [
+      "Administration",
+      "Querying",
+      "Visualization",
+      "Reporting",
+      "Organization",
+      "Embedding",
+      "Database",
+      "Operation",
+      "Semantic Layer",
+      "Metabot",
+      "Misc",
+      "Notifications",
+      "Transforms",
+      "First Experience",
+      "Customization",
+      "DataStudio",
+      "Sharing",
+      "Deployment"
+    ]
+  }
+}
