@@ -19,6 +19,8 @@ The write-up behind this kit, with results on hashicorp/terraform and two public
 
 A third study, the [taxonomy test](#test-your-own-labels), asks a different question: does giving a model your team's own labels help, and which triage decisions (type, owning team, priority) can a model take on at all? It is written up in [Is it the model or your labels?](https://thanoskarpouzis.com/writing/2026/model-or-labels/).
 
+A fourth tool, [`error_budget.py`](#check-whether-a-lane-can-be-trusted), asks how many labelled issues you need before a lane can be trusted, and what to aim for. It is written up in [How many tickets do you have to label before you can trust an AI lane?](https://thanoskarpouzis.com/writing/2026/how-many-labels/).
+
 ## What you need
 
 - Python 3. The scripts use the standard library only, so there is nothing to install.
@@ -42,6 +44,8 @@ Then pick which labels mean bug, feature and question. Names are case-insensitiv
 ```sh
 python3 fetch_repo.py OWNER/REPO --bug "bug" --feature "enhancement,feature request" --question "question"
 ```
+
+On a very busy repository GitHub refuses to page through the issue list past about 10,000 items, pull requests included, and the fetch stops with HTTP 422. Add `--via-search` and issues are listed through GitHub's search in date ranges instead; which issues are kept, and why, stays the same.
 
 This keeps up to 600 issues and 400 merged pull requests created since 1 January 2026 (change with `--since`), so the models you test are unlikely to have seen them in training. It writes them to `kit/OWNER__REPO/data`, with a `manifest.json` recording what was kept and why the rest was skipped. Every answer from GitHub is kept in `kit/OWNER__REPO/cache` as it arrives, so if the fetch stops, running the same command again carries on, and re-deriving the data later makes no API calls at all. Add `--refresh` to fetch fresh data on purpose; the manifest records when the answers used were fetched. Check the manifest before trusting any number: if your team rarely labels issues or rarely leaves review comments, there is not much ground truth to measure against.
 
@@ -113,6 +117,23 @@ python3 explore_taxonomy.py --results-dir kit/OWNER__REPO/results --data-dir kit
 
 Rules for the taxonomy test, fixed before results: label descriptions are used exactly as written, and a label without one is described by its name; every label in a group is offered, deprecated ones included; an issue enters a group only if it carries exactly one label of that group; splits are per issue, about 30% calibration, stratified by type, with a fixed seed. The time split and the baselines in `explore_taxonomy.py` were added after the write-up's results and are exploratory.
 
+## Check whether a lane can be trusted
+
+A lane's threshold is chosen on a small labelled sample, so it can promise more than it delivers. `error_budget.py` measures how often, on your own results and without any new model calls. It merges each model's calibration and evaluation items into one pool, then 2,000 times per sample size (25, 50, 100, 200 and 400 labels) draws a sample, picks the threshold the way `analyze.py` does, and checks it on the rest. A sample size is used only if at least 300 items remain to test on. It also tries two fixes, aiming lower (60% of the budget, so 3% to get 5%) and a safety margin (accept a threshold only when a one-sided 90% exact binomial bound on its error is within budget), and, where items carry dates, sets the threshold on the issues just before a cut-off and tests it on everything after.
+
+```sh
+python3 error_budget.py --results-dir kit/OWNER__REPO/results --data-dir kit/OWNER__REPO/data --out kit/OWNER__REPO/error-budget
+python3 error_budget.py --report kit/OWNER__REPO/error-budget
+```
+
+The report puts each decision and budget in one of three groups, from the lane the plain rule finds on the whole pool:
+
+- **Room**: the lane keeps 99% or more of issues, because the model is rarely wrong. In the write-up the promise held in every draw from 25 labels up. Label 50, check, switch it on.
+- **Edge**: the lane keeps 40% to 99%, and its error sits right at the budget. The plain rule then broke the promise about half the time, by a point or two, however many labels were used. More labels do not fix it; aiming lower or the safety margin does, at a cost in coverage that the report shows.
+- **Sliver**: the lane keeps 10% to 40%. Small samples invent lanes that are not there: with 50 labels, a lane that appeared broke its promise almost every time.
+
+Below 10% there is no lane to speak of. The checks C1 to C3 at the end of the report test those three statements on your data. Two things to watch: a model that reports a handful of round confidence values gives a lane that is all or nothing, so neither fix works well; and random draws are a best case, so re-check after a reorganisation or a change to your labels, not only on a calendar.
+
 ## Reproduce the public benchmarks
 
 The same runner and analysis also work on two public datasets, which are not included here.
@@ -132,7 +153,7 @@ Everything below was fixed before any results were seen.
 - Pull requests: merged only; drafts, bot authors, and reviews by the author or by bots are excluded. "Yes" if any other reviewer left a comment review or requested changes; "no" if at least one other reviewer approved and none commented. Pull requests with no review from anyone else are skipped. Text is the title, the first 600 characters of the description and the diff. Diffs over 20,000 characters are excluded rather than cut (`--max-diff-chars`).
 - About 30% of each label goes to the calibration split, with a fixed seed.
 
-The ground truth is only as good as your team's habits. An approved pull request may still have drawn a comment somewhere, a change request may concern something outside the diff, and leaving out very large diffs tilts the sample towards smaller changes. The local classifier reads at most 512 tokens, so on pull requests it sees only the start of most diffs. A small calibration split makes the chosen threshold optimistic: in the write-up, every no-human lane set for 5% error landed at 6 to 8% on new data, so leave a margin.
+The ground truth is only as good as your team's habits. An approved pull request may still have drawn a comment somewhere, a change request may concern something outside the diff, and leaving out very large diffs tilts the sample towards smaller changes. The local classifier reads at most 512 tokens, so on pull requests it sees only the start of most diffs. A small calibration split makes the chosen threshold optimistic: in the write-up, every no-human lane set for 5% error landed at 6 to 8% on new data, so leave a margin. `error_budget.py` shows how much.
 
 ## Data and privacy
 

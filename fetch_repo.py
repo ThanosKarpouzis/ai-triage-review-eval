@@ -133,10 +133,23 @@ def list_labels(gh, repo):
         print(" ", name)
 
 
-def fetch_issues(gh, repo, groups, since, limit, max_pages):
+def issues_via_search(gh, repo, since):
+    """Issues created since `since`, newest first, through date-split search. For repositories so busy that
+    GitHub refuses to page the issue list past about 10,000 items (pull requests count towards it).
+    Added 10 October 2026; the items kept and the rules applied to them are the same as without it."""
+    from datetime import date
+    from fetch_taxonomy import search_range  # imported here: fetch_taxonomy imports this module
+    found, seen = [], set()
+    search_range(gh, repo, date.fromisoformat(since), date.today(), found)
+    unique = [it for it in found if not (it["number"] in seen or seen.add(it["number"]))]
+    return sorted(unique, key=lambda it: (it["created_at"], it["number"]), reverse=True)
+
+
+def fetch_issues(gh, repo, groups, since, limit, max_pages, via_search=False):
     out, skipped = [], Counter()
-    for it in gh.pages(f"/repos/{repo}/issues", {"state": "all", "sort": "created", "direction": "desc",
-                                                  "since": since + "T00:00:00Z"}, max_pages):
+    listing = issues_via_search(gh, repo, since) if via_search else gh.pages(
+        f"/repos/{repo}/issues", {"state": "all", "sort": "created", "direction": "desc", "since": since + "T00:00:00Z"}, max_pages)
+    for it in listing:
         if it["created_at"][:10] < since:
             break  # sorted newest first, so everything after this is older
         if "pull_request" in it:
@@ -226,6 +239,8 @@ def main():
     ap.add_argument("--max-issues", type=int, default=600)
     ap.add_argument("--max-prs", type=int, default=400)
     ap.add_argument("--max-pages", type=int, default=30, help="pages of 100 to scan per list")
+    ap.add_argument("--via-search", action="store_true",
+                    help="list issues through date-split search, for repositories too busy to page through (GitHub stops at about 10,000 items)")
     ap.add_argument("--calib-share", type=float, default=0.3)
     ap.add_argument("--skip-prs", action="store_true")
     ap.add_argument("--skip-issues", action="store_true")
@@ -257,7 +272,7 @@ def main():
                               "note": "kept from an earlier run; skipped counts not recorded"}
     if not a.skip_issues:
         print(f"Fetching issues from {a.repo} created since {a.since} ...", flush=True)
-        issues, skipped = fetch_issues(gh, a.repo, groups, a.since, a.max_issues, a.max_pages)
+        issues, skipped = fetch_issues(gh, a.repo, groups, a.since, a.max_issues, a.max_pages, a.via_search)
         rows = split(issues, "issue_type", "issue", a.calib_share, random.Random(SEED))
         with (out_dir / "issues.jsonl").open("w", encoding="utf-8") as f:
             for r in rows:
