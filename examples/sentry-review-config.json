@@ -1,0 +1,102 @@
+{
+  "window": [
+    "2026-01-01",
+    "2026-06-30"
+  ],
+  "fix_window_days": 90,
+  "seed": 20261014,
+  "title_rules": {
+    "bugfix": [
+      "fix"
+    ],
+    "capability": [
+      "feat"
+    ]
+  },
+  "repo": "getsentry/sentry",
+  "public_name": "Sentry",
+  "ai_reviewers": [
+    "cursor[bot]",
+    "sentry[bot]",
+    "Copilot"
+  ],
+  "excluded_bots": [
+    "sentry-junior[bot]",
+    "sentry-warden[bot]",
+    "github-advanced-security[bot]",
+    "github-actions[bot]",
+    "codecov[bot]",
+    "dependabot[bot]",
+    "getsantry[bot]",
+    "semgrep-code-getsentry[bot]"
+  ],
+  "bug_labels_pr": [
+    "Type: Bug",
+    "Bug"
+  ],
+  "bug_labels_issue": [
+    "Type: Bug",
+    "Bug"
+  ],
+  "capability_labels": [
+    "Type: Feature Request"
+  ],
+  "capability_labels_issue": [
+    "Type: Feature Request"
+  ],
+  "area_labels": {
+    "Scope: Frontend": "frontend",
+    "Scope: Backend": "backend"
+  },
+  "path_rules": [
+    {
+      "match": "static/",
+      "area": "frontend"
+    },
+    {
+      "match": "src/sentry/",
+      "area": "backend"
+    },
+    {
+      "match": "tests/js/",
+      "area": "frontend"
+    },
+    {
+      "match": "tests/",
+      "area": "backend"
+    },
+    {
+      "match": ".tsx",
+      "area": "frontend"
+    },
+    {
+      "match": ".ts",
+      "area": "frontend"
+    },
+    {
+      "match": ".jsx",
+      "area": "frontend"
+    },
+    {
+      "match": ".js",
+      "area": "frontend"
+    },
+    {
+      "match": ".scss",
+      "area": "frontend"
+    },
+    {
+      "match": ".less",
+      "area": "frontend"
+    },
+    {
+      "match": ".css",
+      "area": "frontend"
+    },
+    {
+      "match": ".py",
+      "area": "backend"
+    }
+  ],
+  "notes": "cursor[bot]: third-party AI review app. sentry[bot]: the project's own product's AI code review. Excluded: sentry-junior[bot] (in-house assistant answering questions in threads, not a reviewer), sentry-warden[bot] and github-advanced-security[bot] (security review, out under the comms guardrails), CI and dependency bots. Added 17 October 2026 after the full fetch, before any outcome: Copilot (GitHub's built-in reviewer, 10 first comments) as AI; semgrep-code-getsentry[bot] (static analysis) excluded."
+}

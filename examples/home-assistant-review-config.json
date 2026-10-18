@@ -1,0 +1,43 @@
+{
+  "window": [
+    "2026-01-01",
+    "2026-06-30"
+  ],
+  "fix_window_days": 90,
+  "seed": 20261014,
+  "title_rules": {
+    "bugfix": [
+      "fix"
+    ],
+    "capability": [
+      "feat"
+    ]
+  },
+  "repo": "home-assistant/core",
+  "public_name": "Home Assistant",
+  "ai_reviewers": [
+    "Copilot",
+    "chatgpt-codex-connector[bot]",
+    "coderabbitai[bot]"
+  ],
+  "excluded_bots": [
+    "github-actions[bot]",
+    "home-assistant[bot]",
+    "codecov[bot]",
+    "dependabot[bot]"
+  ],
+  "bug_labels_pr": [
+    "bugfix"
+  ],
+  "bug_labels_issue": [
+    "bug"
+  ],
+  "capability_labels": [
+    "new-feature",
+    "new-integration"
+  ],
+  "capability_labels_issue": [],
+  "area_labels": {},
+  "path_rules": [],
+  "notes": "Python only, so no front-end/back-end split. Copilot: GitHub's built-in reviewer. chatgpt-codex-connector[bot] and coderabbitai[bot]: third-party AI reviewers, few comments. Excluded: github-actions[bot] (quality-scale checks run in CI; cannot be attributed to an AI reviewer)."
+}

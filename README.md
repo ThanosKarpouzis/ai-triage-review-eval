@@ -21,6 +21,8 @@ A third study, the [taxonomy test](#test-your-own-labels), asks a different ques
 
 A fourth tool, [`error_budget.py`](#check-whether-a-lane-can-be-trusted), asks how many labelled issues you need before a lane can be trusted, and what to aim for. It is written up in [How many tickets do you have to label before you can trust an AI lane?](https://thanoskarpouzis.com/writing/2026/how-many-labels/).
 
+A fifth tool, [`review_bot.py`](#is-your-review-bot-earning-its-place), asks whether your AI reviewer's comments are acted on, and whether the flags nobody acted on turned out to be right, with your human reviewers as the yardstick.
+
 ## What you need
 
 - Python 3. The scripts use the standard library only, so there is nothing to install.
@@ -133,6 +135,41 @@ The report puts each decision and budget in one of three groups, from the lane t
 - **Sliver**: the lane keeps 10% to 40%. Small samples invent lanes that are not there: with 50 labels, a lane that appeared broke its promise almost every time.
 
 Below 10% there is no lane to speak of. The checks C1 to C3 at the end of the report test those three statements on your data. Two things to watch: a model that reports a handful of round confidence values gives a lane that is all or nothing, so neither fix works well; and random draws are a best case, so re-check after a reorganisation or a change to your labels, not only on a calendar.
+
+## Is your review bot earning its place
+
+`review_bot.py` asks what happens to the lines a review comment points at, for your AI reviewer and for your human reviewers side by side. For every inline review comment on a merged pull request it records three things: whether the flagged lines changed before merge; whether they were changed again within 90 days of merge by a commit that fixed a bug; and the same two for a *placebo*, a stretch of lines the same pull request added, of the same length and on the same commit, that nobody commented on. Code keeps moving, so some flagged lines change by coincidence. Only the difference from the placebo counts.
+
+It needs a read-only GitHub token (review threads come from GitHub's GraphQL interface, which does not answer without one), `git`, and a clone of your default branch. No model calls.
+
+**1. Write a config.** Copy [`examples/sentry-review-config.json`](examples/sentry-review-config.json) or [`examples/home-assistant-review-config.json`](examples/home-assistant-review-config.json). List your AI reviewer accounts in `ai_reviewers` (as GitHub shows them, for example `cursor[bot]` or `Copilot`) and every other bot in `excluded_bots`; your bug labels on pull requests and issues; your capability labels; and, if you want a front-end and back-end split, your area labels or path rules. Several AI reviewers are pooled as one.
+
+**2. Fetch, clone, map, follow, report.**
+
+```sh
+export GITHUB_TOKEN=paste-a-read-only-token
+python3 -m unittest tests/test_review_bot.py
+python3 review_bot.py fetch --config my-review-config.json --smoke     # five pull requests, to check the token and the bot names
+python3 review_bot.py fetch --config my-review-config.json
+git clone --single-branch --shallow-since=2025-12-01 https://github.com/OWNER/REPO my-clone
+python3 review_bot.py map --config my-review-config.json --clone my-clone
+python3 review_bot.py fixes --config my-review-config.json --clone my-clone
+python3 review_bot.py report --config my-review-config.json --null     # must pass before you read anything else
+python3 review_bot.py report --config my-review-config.json
+python3 review_bot.py sample --config my-review-config.json --n 30     # comments to read by hand, and three pull requests to count
+```
+
+The fetch keeps the newest 1,500 merged pull requests in the config's window that carry a qualifying comment. Every GitHub answer is cached, so any step can be stopped and re-run. The tool waits out GitHub's hourly limits on its own; on a busy repository the map step can take a few hours.
+
+**3. Read the report.** The first table gives, per reviewer and per split, the acted-on rate, the resolved rate, and for ignored flags (lines nobody changed before merge) how often they were fixed later against their placebo: the *excess*. The second gives the acted-on rate corrected for churn the same way, and from it the number of comments a person reads for each change a comment causes, which is the figure to set against what the bot costs you. It also shows how many resolved threads were resolved by a bot. The third table is the sample-size rule: from your own placebo fix rate, how many ignored flags each reviewer kind needs before a one, two, three or five point excess could show (95% confidence, 80% power), against how many you have, and the smallest excess your current history could have shown. Collect until the difference you care about is in reach.
+
+**Your fix signal decides what the tool can see.** The tool picks it with one rule: your bug labels if at least 10% of the later pull requests that touched flagged code carry one, otherwise titles starting with "fix" if at least 10% follow that convention, otherwise none, and the report says so. With no usable fix signal, the post-merge question cannot be asked of your history; the acted-on figures still can.
+
+Rules fixed before results in the write-up: inline comments only, first in their thread, on the new side of the diff, not by the pull request's author; a placebo at least five lines from any comment, same file first, fixed seed; an ignored flag is compared with a placebo also untouched before merge; 95% intervals by bootstrap over whole pull requests, 2,000 draws; cells with fewer than 100 ignored AI flags are marked too thin. The null check swaps each comment for a second, independent placebo; every interval must then contain zero. In the write-up it caught two biases before any result was read.
+
+Limits: a line change is not agreement, and a later fix on flagged lines is not proof the flag was about that defect. Reading 30 fixed comments by hand per repository, the later fix answered the comment in about one case in eight. Humans choose which lines to comment on and bots comment widely, so this compares reviewers as your team uses them. Comments on commits that were force-pushed away cannot be followed and are counted and left out.
+
+It is written up in [Do your review bot's warnings turn into bugs?](https://thanoskarpouzis.com/writing/2026/review-bot-warnings/).
 
 ## Reproduce the public benchmarks
 
