@@ -23,9 +23,11 @@ A fourth tool, [`error_budget.py`](#check-whether-a-lane-can-be-trusted), asks h
 
 A fifth tool, [`review_bot.py`](#is-your-review-bot-earning-its-place), asks whether your AI reviewer's comments are acted on, and whether the flags nobody acted on turned out to be right, with your human reviewers as the yardstick.
 
+A sixth tool, [`agent_lane.py`](#which-tickets-can-you-hand-to-an-agent), asks whether you can tell from the ticket alone which tickets an agent will land, within an error budget. It is written up in [Which tickets can you hand to an agent?](https://thanoskarpouzis.com/writing/2026/agent-lane/).
+
 ## What you need
 
-- Python 3. The scripts use the standard library only, so there is nothing to install.
+- Python 3. The scripts use the standard library only, so there is nothing to install. The one exception is `prep_aidev.py`, which converts a public dataset once and needs `pyarrow`.
 - A GitHub token, strongly advised. Without one GitHub allows 60 requests an hour, far too few for pull requests. A fine-grained personal access token with read-only access to public repositories is enough; for a private repository it needs read access to its issues, pull requests and contents. Keep it in an environment variable, never in a file.
 - An API key for [Vercel AI Gateway](https://vercel.com/ai-gateway), which serves the language models used here. The free tier is heavily rate-limited, so a small paid credit is needed.
 - Optionally, Docker, for the local classifier. It is the option to use when code must not leave your machine.
@@ -170,6 +172,40 @@ Rules fixed before results in the write-up: inline comments only, first in their
 Limits: a line change is not agreement, and a later fix on flagged lines is not proof the flag was about that defect. Reading 30 fixed comments by hand per repository, the later fix answered the comment in about one case in eight. Humans choose which lines to comment on and bots comment widely, so this compares reviewers as your team uses them. Comments on commits that were force-pushed away cannot be followed and are counted and left out.
 
 It is written up in [Do your review bot's warnings turn into bugs?](https://thanoskarpouzis.com/writing/2026/review-bot-warnings/).
+
+## Which tickets can you hand to an agent
+
+`agent_lane.py` takes the pull requests your coding agent opened for an issue and asks whether the issue alone, read before any work started, says which ones would land. It is a fourth lane next to the three above, the *agent lane*: the largest share of tickets, from the top of a ranking down, whose failure rate stays within a budget (15% by default, 5% reported too) under the safety-margin rule from `error_budget.py`, chosen on your earlier tickets and judged on your later ones.
+
+Each attempt gets three outcomes: *merged*; *landed clean*, merged with no review requesting changes and no commit by a person other than the agent (merges of the main branch and other bot accounts do not count); and *landed and held*, landed clean with no fixing commit on the same files within 30 days. A model reads only the issue, the repository's language and a size bucket, and returns a task type, six yes or no checks and its own probability that an agent would land the ticket. Four rankings are compared: documentation yes and everything else no, task type alone, the model's probability, and task type plus checks combined by a small logistic regression.
+
+It needs a read-only GitHub token and the AI gateway key above. Scoring costs about $1.50 per thousand tickets with Claude Haiku 4.5.
+
+```sh
+export GITHUB_TOKEN=paste-a-read-only-token
+export AI_GATEWAY_API_KEY=paste-your-key
+python3 -m unittest tests/test_agent_lane.py
+python3 agent_lane.py own-table --repo OWNER/REPO --agent-logins "Copilot,devin-ai-integration[bot]" --since 2025-01-01 \
+    --config examples/aidev-agent-lane-config.json --out kit/OWNER__REPO/agent/table.jsonl
+python3 agent_lane.py score --table kit/OWNER__REPO/agent/table.jsonl --config examples/aidev-agent-lane-config.json \
+    --out kit/OWNER__REPO/agent/scores.jsonl --smoke
+python3 agent_lane.py score --table kit/OWNER__REPO/agent/table.jsonl --config examples/aidev-agent-lane-config.json \
+    --out kit/OWNER__REPO/agent/scores.jsonl
+python3 agent_lane.py lanes --table kit/OWNER__REPO/agent/table.jsonl --scores kit/OWNER__REPO/agent/scores.jsonl \
+    --config examples/aidev-agent-lane-config.json --out kit/OWNER__REPO/agent/lanes.json --shuffle   # must open no lane
+python3 agent_lane.py lanes --table kit/OWNER__REPO/agent/table.jsonl --scores kit/OWNER__REPO/agent/scores.jsonl \
+    --config examples/aidev-agent-lane-config.json --out kit/OWNER__REPO/agent/lanes.json
+python3 agent_lane.py held-plan --table kit/OWNER__REPO/agent/table.jsonl --out kit/OWNER__REPO/agent/held-plan.jsonl
+python3 agent_lane.py held --plan kit/OWNER__REPO/agent/held-plan.jsonl --config examples/aidev-agent-lane-config.json \
+    --out kit/OWNER__REPO/agent/held.jsonl
+python3 agent_lane.py report --lanes kit/OWNER__REPO/agent/lanes.json --out kit/OWNER__REPO/agent/report.md
+```
+
+If your agent commits under a developer's account, pass `--commit-marker` with a pattern its commit messages always carry (for example a co-author trailer); without one, only merged can be judged. `own-table` finds the issue from a closing reference in the pull request's description ("fixes #123"), so attempts without one are not counted; the manifest says how many. Every GitHub answer and every model reply is kept, so any step can be re-run without new calls (`rescore` re-reads stored replies; `--retry-errors` asks again only for answers that failed).
+
+Expect a lane to be possible only once you have a few hundred attempts with an outcome. In the write-up, on 1,194 public tickets that agents attempted, documentation tickets landed clean 57% of the time against 17% for features, but no ranking opened a lane at either budget: the best slice still failed about a third of the time. To reproduce it, [`prep_aidev.py`](prep_aidev.py) converts the AIDev tables (CC BY 4.0, Li, Zhang and Hassan) to the JSONL `agent_lane.py aidev-table` reads; it is the one script here that needs a library, `pyarrow`, and its header has the download commands.
+
+It is written up in [Which tickets can you hand to an agent?](https://thanoskarpouzis.com/writing/2026/agent-lane/).
 
 ## Reproduce the public benchmarks
 
