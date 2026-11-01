@@ -10,7 +10,9 @@ The method, one subcommand per step:
   packets  one file per task for the fairness screen: could a fix written from the issue alone pass the tests?
   run      hand each task's issue text to the agent harness in a fresh container and keep the diff it leaves
   score    apply the diff and the withheld tests; resolved when every new test passes and no old one breaks
-  report   the funnel, flakiness, two runs side by side, cost, and the predictions
+  report   the funnel, flakiness, two runs side by side, cost, and the predictions; also report.json,
+           every headline figure by name, so a write-up can cite numbers instead of retyping them
+  all      the whole pipeline in one command, restartable, with a log of every step
 
 Standard library only. The run step calls the harness's own Python environment (see bench/setup-env.sh).
 Written up in the third post of the series "Ask your own repository" on thanoskarpouzis.com.
@@ -605,6 +607,100 @@ def predictions(mine_m, split_m, verify_m, runs):
     return out
 
 
+def wilson(k, n, z=1.96):
+    """Wilson 95% interval for k of n, as (low, high) fractions; None when n is 0."""
+    if not n:
+        return None
+    p, z2 = k / n, z * z
+    centre = (p + z2 / (2 * n)) / (1 + z2 / n)
+    half = z * ((p * (1 - p) / n + z2 / (4 * n * n)) ** 0.5) / (1 + z2 / n)
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def pct(x):
+    return None if x is None else round(100 * x)
+
+
+def run_figures(rs):
+    """Headline figures for one scored run."""
+    n = len(rs)
+    resolved = sum(bool(r["resolved"]) for r in rs)
+    costs = [r["cost"] for r in rs if r["cost"] is not None]
+    res_costs = [r["cost"] for r in rs if r["resolved"] and r["cost"] is not None]
+    calls = [r["api_calls"] for r in rs if r.get("api_calls") is not None]
+    walls = [r["wall_s"] for r in rs if r.get("wall_s") is not None]
+    tok_in = sum((r.get("tokens") or {}).get("input", 0) for r in rs)
+    tok_out = sum((r.get("tokens") or {}).get("output", 0) for r in rs)
+    tok_cache = sum((r.get("tokens") or {}).get("cache_read", 0) for r in rs)
+    med_res = median(res_costs)
+    iv = wilson(resolved, n)
+    return {"tasks": n, "resolved": resolved, "resolved_pct": pct(resolved / n) if n else None,
+            "resolved_interval_pct": [pct(iv[0]), pct(iv[1])] if iv else None,
+            "capped": sum(bool(r.get("capped")) for r in rs),
+            "submitted": sum(1 for r in rs if str(r.get("exit_status") or "").lower() == "submitted"),
+            "unresolved_submitted": sum(1 for r in rs if not r["resolved"] and str(r.get("exit_status") or "").lower() == "submitted"),
+            "cost_total": round(sum(costs), 2), "cost_median": round(median(costs) or 0, 3),
+            "cost_max": round(max(costs), 3) if costs else None,
+            "resolved_cost_median": round(med_res or 0, 3), "resolved_cost_max": round(max(res_costs), 3) if res_costs else None,
+            "resolved_cost_max_over_median": round(max(res_costs) / med_res, 1) if res_costs and med_res else None,
+            "calls_median": median(calls), "wall_s_median": round(median(walls)) if walls else None,
+            "wall_s_max": round(max(walls)) if walls else None, "wall_s_total": round(sum(walls)) if walls else None,
+            "tokens_input": tok_in, "tokens_output": tok_out, "tokens_cache_read": tok_cache}
+
+
+def report_figures(repo, mine_m, split_m, verify_m, run_ids, runs, labels=None):
+    """Every number a write-up would cite, by name. Pure: no files, so the tests can feed it manifests."""
+    backports = split_m["rejected"].get("backport of another candidate", 0)
+    distinct = mine_m["kept"] - backports
+    fig = {"repo": repo, "merged_since": mine_m["merged_since"], "written": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "funnel": {"pull_requests_seen": mine_m["pull_requests_seen"], "candidates": mine_m["kept"],
+                      "mining_rejected": mine_m["rejected"], "backports_folded": backports,
+                      "distinct_issues": distinct, "after_split": split_m["kept"], "split_rejected": split_m["rejected"],
+                      "verify_repeats": verify_m["repeats"], "survivors": verify_m["survivors"],
+                      "verify_rejected": verify_m["rejected"], "flaky": len(verify_m["flaky"]),
+                      "bench_errors": verify_m["bench_errors"],
+                      "candidates_per_pull_request_pct": pct(mine_m["kept"] / mine_m["pull_requests_seen"]) if mine_m["pull_requests_seen"] else None,
+                      "survivors_per_distinct_issue_pct": pct(verify_m["survivors"] / distinct) if distinct else None,
+                      "by_step": dict(funnel_steps(mine_m, split_m, verify_m))},
+           "runs": {rid: run_figures(rs) for rid, rs in zip(run_ids, runs)}}
+    if len(runs) >= 2:
+        a = {r["task_id"]: bool(r["resolved"]) for r in runs[0]}
+        b = {r["task_id"]: bool(r["resolved"]) for r in runs[1]}
+        common = sorted(set(a) & set(b))
+        both = [t for t in common if a[t] and b[t]]
+        one = [t for t in common if a[t] != b[t]]
+        ratios = []
+        for t in common:
+            ca = next((r["cost"] for r in runs[0] if r["task_id"] == t), None)
+            cb = next((r["cost"] for r in runs[1] if r["task_id"] == t), None)
+            if ca and cb:
+                ratios.append(max(ca, cb) / min(ca, cb))
+        fig["agreement"] = {"runs": run_ids[:2], "tasks": len(common), "resolved_in_both": len(both),
+                            "resolved_in_exactly_one": len(one), "exactly_one_pct": pct(len(one) / len(common)) if common else None,
+                            "agree": len(common) - len(one), "differing_tasks": one,
+                            "cost_ratio_median": round(median(ratios), 2) if ratios else None,
+                            "cost_ratio_max": round(max(ratios), 1) if ratios else None}
+    if labels:
+        fig["fairness"] = {}
+        for label in ("fair", "unfair", "unclear"):
+            ids = {t for t, v in labels.items() if v == label}
+            if not ids:
+                continue
+            fig["fairness"][label] = {"tasks": len(ids), "runs": {}}
+            for rid, rs in zip(run_ids, runs):
+                sub = [r for r in rs if r["task_id"] in ids]
+                k = sum(bool(r["resolved"]) for r in sub)
+                iv = wilson(k, len(sub))
+                fig["fairness"][label]["runs"][rid] = {"resolved": k, "of": len(sub), "pct": pct(k / len(sub)) if sub else None,
+                                                       "interval_pct": [pct(iv[0]), pct(iv[1])] if iv else None}
+    fig["predictions"] = [{"name": name, "verdict": "held" if held else "failed", "detail": detail if isinstance(detail, str) else json.dumps(detail)}
+                          for name, held, detail in predictions(mine_m, split_m, verify_m, runs)]
+    if runs:
+        fig["per_task"] = [{"task_id": r["task_id"], **{rid: bool(next((x["resolved"] for x in rs if x["task_id"] == r["task_id"]), False)) for rid, rs in zip(run_ids, runs)}}
+                           for r in sorted(runs[0], key=lambda r: r["task_id"])]
+    return fig
+
+
 def report(args):
     recipe = load_recipe(args.recipe)
     kd = kit_dir(recipe["repo"])
@@ -646,8 +742,69 @@ def report(args):
     L += [f"- {name}: {'HELD' if held else 'FAILED'} ({detail})" for name, held, detail in preds]
     out = Path(args.out) if args.out else kd / "report.md"
     out.write_text("\n".join(L) + "\n", encoding="utf-8")
+    labels = {j["task_id"]: j["label"] for j in read_jsonl(args.labels)} if args.labels else None
+    fig = report_figures(recipe["repo"], mine_m, split_m, verify_m, list(args.runs), runs, labels)
+    out_json = out.with_suffix(".json")
+    out_json.write_text(json.dumps(fig, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print("\n".join(f"{name}: {'HELD' if held else 'FAILED'} ({detail})" for name, held, detail in preds))
-    print(f"wrote {out}")
+    print(f"wrote {out} and {out_json}")
+
+
+# ---------------------------------------------------------------------------- all
+
+def all_steps(args):
+    """Run the pipeline end to end. Every step is restartable, so rerunning after a failure resumes."""
+    recipe = load_recipe(args.recipe)
+    kd = kit_dir(recipe["repo"])
+    kd.mkdir(parents=True, exist_ok=True)
+    log = kd / "all.log"
+    run_ids = [f"{args.run_prefix}{i}" for i in range(1, args.runs + 1)]
+
+    def note(msg):
+        line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
+        print(line, flush=True)
+        with log.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    def step(name, func, **kw):
+        note(f"== {name}")
+        t0 = time.time()
+        try:
+            func(argparse.Namespace(**kw))
+        except SystemExit as e:
+            if e.code not in (None, 0):
+                note(f"!! {name} stopped: {e.code}")
+                raise
+        except Exception as e:  # noqa: BLE001
+            note(f"!! {name} failed: {type(e).__name__}: {e}")
+            raise
+        note(f"ok {name} in {time.time() - t0:.0f}s")
+
+    note(f"all: {recipe['repo']} (runs {run_ids}, repeats {args.repeats}, spend cap ${args.spend_cap} per run)")
+    if args.since or not (kd / "candidates.jsonl").exists():
+        if not args.since:
+            sys.exit("no candidates yet: pass --since YYYY-MM-DD (the leakage window) so that mine can run")
+        step("mine", mine, repo=recipe["repo"], since=args.since, target=args.target,
+             test_dirs=",".join(recipe.get("test_dirs", list(DEFAULT_TEST_DIRS))), out=None, refresh=False)
+    else:
+        note("mine: candidates.jsonl exists, kept (pass --since to mine again)")
+    step("image", image, recipe=args.recipe)
+    step("split", split, recipe=args.recipe, repo_dir=args.repo_dir)
+    step("verify", verify, recipe=args.recipe, repeats=args.repeats, only=None)
+    step("freeze", freeze, recipe=args.recipe, force=False)
+    step("packets", packets, recipe=args.recipe)
+    if args.skip_run:
+        note("runs skipped (--skip-run); the bench is frozen and ready")
+        return
+    cfg = json.loads((BENCH / "harness.json").read_text(encoding="utf-8"))
+    if not os.environ.get(cfg["model"]["api_key_env"]):
+        sys.exit(f"the bench is frozen; set {cfg['model']['api_key_env']} and rerun to start the runs")
+    for rid in run_ids:
+        step(f"run {rid}", run_agent, recipe=args.recipe, run_id=rid, cost_cap=args.cost_cap,
+             spend_cap=args.spend_cap, only=None)
+        step(f"score {rid}", score, recipe=args.recipe, run_id=rid, run_dir=None, out_name=None)
+    step("report", report, recipe=args.recipe, runs=run_ids, labels=args.labels, out=None)
+    note(f"all done; figures in {kd / 'report.json'}")
 
 
 # ---------------------------------------------------------------------------- command line
@@ -719,6 +876,21 @@ def main(argv=None):
     p.add_argument("--labels", help=argparse.SUPPRESS)
     p.add_argument("--out", help=argparse.SUPPRESS)
     p.set_defaults(func=report)
+
+    p = sub.add_parser("all", help="the whole pipeline: mine (first time), image, split, verify, freeze, packets, "
+                                   "the runs, score and report, with a log in the kit folder")
+    p.add_argument("--recipe", required=True, **rec)
+    p.add_argument("--repo-dir", required=True, help="a local clone of the repository")
+    p.add_argument("--since", help="leakage window for mine (YYYY-MM-DD); required the first time, reruns mine when given")
+    p.add_argument("--target", type=int, default=60, help="mine: stop after this many candidates (default 60)")
+    p.add_argument("--repeats", type=int, default=3, help="verify repeats (default 3)")
+    p.add_argument("--runs", type=int, default=2, help="how many identical runs (default 2)")
+    p.add_argument("--run-prefix", default="r", help="run ids are PREFIX1, PREFIX2, ... (default r)")
+    p.add_argument("--cost-cap", type=float, help="dollars per task; default from bench/harness.json")
+    p.add_argument("--spend-cap", type=float, default=25.0, help="dollars per run (default 25)")
+    p.add_argument("--labels", help="fairness labels for the report, if the screen has been run")
+    p.add_argument("--skip-run", action="store_true", help="stop after freeze and packets (no model calls)")
+    p.set_defaults(func=all_steps)
 
     args = ap.parse_args(argv)
     args.func(args)

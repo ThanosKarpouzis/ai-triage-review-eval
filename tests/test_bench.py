@@ -120,6 +120,46 @@ class Freeze(unittest.TestCase):
         self.assertNotEqual(bench.canonical_checksum(tasks), bench.canonical_checksum(changed))
 
 
+class Figures(unittest.TestCase):
+    """report.json: the figures a write-up cites, computed from manifests and scored runs alone."""
+
+    def test_wilson(self):
+        lo, hi = bench.wilson(15, 44)
+        self.assertEqual((round(lo * 100), round(hi * 100)), (22, 49))
+        self.assertIsNone(bench.wilson(0, 0))
+        self.assertEqual(bench.wilson(0, 10)[0], 0.0)
+
+    def test_report_figures(self):
+        mine_m = {"merged_since": "2026-07-01", "pull_requests_seen": 100, "kept": 12,
+                  "rejected": {"closes no issue": 80, "no test file changed": 8}}
+        split_m = {"kept": 10, "rejected": {"backport of another candidate": 2}}
+        verify_m = {"repeats": 3, "survivors": 8, "rejected": {"tests did not fail before": 2}, "flaky": [],
+                    "bench_errors": 0}
+        def row(tid, resolved, cost, calls=5, status="Submitted"):
+            return {"task_id": tid, "resolved": resolved, "cost": cost, "api_calls": calls, "wall_s": 30.0,
+                    "capped": status == "cost limit", "exit_status": status,
+                    "tokens": {"input": 1000, "output": 100, "cache_read": 0}}
+        r1 = [row("t1", True, 0.10), row("t2", True, 0.50), row("t3", False, 0.10), row("t4", False, 1.0, status="cost limit")]
+        r2 = [row("t1", True, 0.20), row("t2", True, 0.40), row("t3", True, 0.10), row("t4", False, 1.0, status="cost limit")]
+        labels = {"t1": "fair", "t2": "fair", "t3": "unfair", "t4": "unfair"}
+        fig = bench.report_figures("o/r", mine_m, split_m, verify_m, ["r1", "r2"], [r1, r2], labels)
+        f = fig["funnel"]
+        self.assertEqual((f["candidates"], f["distinct_issues"], f["survivors"]), (12, 10, 8))
+        self.assertEqual(f["candidates_per_pull_request_pct"], 12)
+        self.assertEqual(f["by_step"], {"fail-then-pass test check": 2})
+        self.assertEqual(fig["runs"]["r1"]["resolved"], 2)
+        self.assertEqual(fig["runs"]["r1"]["capped"], 1)
+        self.assertEqual(fig["runs"]["r1"]["unresolved_submitted"], 1)
+        self.assertEqual(fig["runs"]["r1"]["resolved_cost_max_over_median"], 1.7)
+        self.assertEqual(fig["runs"]["r1"]["tokens_input"], 4000)
+        a = fig["agreement"]
+        self.assertEqual((a["tasks"], a["resolved_in_both"], a["resolved_in_exactly_one"], a["differing_tasks"]), (4, 2, 1, ["t3"]))
+        self.assertEqual(a["cost_ratio_max"], 2.0)
+        self.assertEqual(fig["fairness"]["fair"]["runs"]["r1"], {"resolved": 2, "of": 2, "pct": 100, "interval_pct": [34, 100]})
+        self.assertEqual([p["verdict"] for p in fig["predictions"]], ["failed", "held", "failed", "held", "failed"])
+        self.assertEqual(fig["per_task"][2], {"task_id": "t3", "r1": False, "r2": True})
+
+
 # ---------------------------------------------------------------------------- with Docker and the bench image
 
 import json  # noqa: E402
