@@ -1,0 +1,6 @@
+# Pins for pytest's bench image lock. lock.py adds a pin for any package newer than 14 days.
+coverage==7.16.2  # added by lock.py 2026-10-31, 7.17.0 was too new
+hypothesis==6.170.1  # added by lock.py 2026-10-31, 6.170.14 was too new
+setuptools==84.0.0  # added by lock.py 2026-10-31, 84.2.1 was too new
+certifi==2026.7.22  # added by lock.py 2026-10-31, 2026.10.23 was too new
+pytest==9.1.1  # added by lock.py 2026-10-31, 9.2.0 was too new

@@ -1,0 +1,2 @@
+# What the harness image installs; versions are pinned in constraints.txt and locked in requirements.lock.
+mini-swe-agent

@@ -1,0 +1,30 @@
+{
+  "_notes": "Settings for the agent harness, read by bench.py's run step and by runner/run_task.py inside the task container. Held fixed for both baseline runs. Harness: mini-swe-agent 2.4.6 (MIT) with its own swebench.yaml as prompt and tools; only the values below differ. The harness runs inside the task container (image from the recipe, built on bench-harness), on the bench-internal network, whose only exit is the bench-egress proxy, which allows the gateway alone. The agent's commands run as the unprivileged user `agent` with a clean environment. The gateway key is read from AI_GATEWAY_API_KEY on the host and handed to the harness on its standard input; it is never written to a file or put in the container's environment. No temperature is set: Claude Sonnet 5.5 rejects sampling parameters. Prices are Anthropic's list prices per million tokens (read 31 October 2026), used to count cost from the usage the gateway reports.",
+  "harness": "mini-swe-agent",
+  "harness_version": "2.4.6",
+  "base_config": "swebench.yaml",
+  "agent": {
+    "cost_limit": 1.0,
+    "step_limit": 75
+  },
+  "environment": {
+    "network": "bench-internal",
+    "proxy": "http://bench-egress:3128",
+    "agent_user": "agent",
+    "cwd": "/testbed",
+    "timeout": 120
+  },
+  "model": {
+    "model_name": "openai/anthropic/claude-sonnet-5-5",
+    "api_base": "https://ai-gateway.vercel.sh/v1",
+    "api_key_env": "AI_GATEWAY_API_KEY",
+    "price_per_mtok": {
+      "input": 2.0,
+      "output": 10.0,
+      "cache_read": 0.1,
+      "cache_write": 2.5
+    }
+  },
+  "task_preamble": "The repository {repo} is checked out in /testbed at the commit before this issue was fixed. Fix the issue below in the working tree.",
+  "wall_time_limit_s": 2700
+}

@@ -1,0 +1,18 @@
+{
+  "repo": "pytest-dev/pytest",
+  "default_branch": "main",
+  "notes": "pytest tests itself. The checkout is installed editable into /opt/testbed with no network; its version comes from SETUPTOOLS_SCM_PRETEND_VERSION because a checkout without history gives setuptools-scm nothing to read. Test files: anything under testing/, and pytest runs only files matching its own python_files patterns, outside the folders its config excludes.",
+  "base_image": "bench-harness:2.4.6",
+  "image": "bench-pytest-dev__pytest:1",
+  "requirements": "pytest-dev__pytest.requirements.in",
+  "constraints": "pytest-dev__pytest.constraints.txt",
+  "lock": "pytest-dev__pytest.lock",
+  "test_dirs": ["testing"],
+  "run_globs": ["testing/**/test_*.py", "testing/**/*_test.py", "testing/python/*.py"],
+  "run_exclude": ["testing/example_scripts/", "testing/plugins_integration/"],
+  "setup": "/opt/testbed/bin/pip install --quiet --no-deps --no-build-isolation --no-index -e /testbed",
+  "env": {"SETUPTOOLS_SCM_PRETEND_VERSION": "9.1.0.dev0"},
+  "pytest_args": ["-p", "no:cacheprovider", "-q"],
+  "timeout_s": 600,
+  "docker": {"cpus": "4", "memory": "4g"}
+}

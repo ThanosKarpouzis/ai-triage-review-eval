@@ -1,0 +1,20 @@
+# Pins for the harness lock, chosen 31 October 2026. Rule: the harness at the version the spec names, and
+# LiteLLM at a release at least 14 days old with no incident on record (1.82.7 and 1.82.8 were malicious,
+# March 2026). lock.py adds a pin here for any other dependency newer than 14 days.
+mini-swe-agent==2.4.6
+litellm==1.105.1
+pydantic==2.14.1  # added by lock.py 2026-10-31, 2.14.2 was too new
+pydantic_core==2.50.1  # added by lock.py 2026-10-31, 2.50.2 was too new
+platformdirs==4.13.3  # added by lock.py 2026-10-31, 4.14.0 was too new
+boto3==1.43.114  # added by lock.py 2026-10-31, 1.43.123 was too new
+certifi==2026.7.22  # added by lock.py 2026-10-31, 2026.10.23 was too new
+jiter==0.17.0  # added by lock.py 2026-10-31, 0.18.0 was too new
+pydantic-settings==2.16.0  # added by lock.py 2026-10-31, 2.16.2 was too new
+wcwidth==0.9.2  # added by lock.py 2026-10-31, 0.9.4 was too new
+pandas==3.0.6  # added by lock.py 2026-10-31, 3.1.0 was too new
+xxhash==4.0.1  # added by lock.py 2026-10-31, 4.0.2 was too new
+botocore==1.43.114  # added by lock.py 2026-10-31, 1.43.123 was too new
+hf-xet==1.7.0  # added by lock.py 2026-10-31, 1.8.0 was too new
+multidict==7.1.0  # added by lock.py 2026-10-31, 7.2.1 was too new
+s3transfer==0.19.2  # added by lock.py 2026-10-31, 0.19.3 was too new
+zipp==4.1.1  # added by lock.py 2026-10-31, 4.1.2 was too new

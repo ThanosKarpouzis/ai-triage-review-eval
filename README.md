@@ -25,6 +25,8 @@ A fifth tool, [`review_bot.py`](#is-your-review-bot-earning-its-place), asks whe
 
 A sixth tool, [`agent_lane.py`](#which-tickets-can-you-hand-to-an-agent), asks whether you can tell from the ticket alone which tickets an agent will land, within an error budget. It is written up in [Which tickets can you hand to an agent?](https://thanoskarpouzis.com/writing/2026/agent-lane/).
 
+A seventh tool, [`bench.py`](#build-a-test-bench-from-your-own-fixed-issues), turns your repository's fixed issues into a small private benchmark for coding agents, with the checks that make each task trustworthy, and runs an agent setup on it. It is written up in [Can your own history be your benchmark?](https://thanoskarpouzis.com/writing/2026/test-bench/).
+
 ## What you need
 
 - Python 3. The scripts use the standard library only, so there is nothing to install. The one exception is `prep_aidev.py`, which converts a public dataset once and needs `pyarrow`.
@@ -206,6 +208,49 @@ If your agent commits under a developer's account, pass `--commit-marker` with a
 Expect a lane to be possible only once you have a few hundred attempts with an outcome. In the write-up, on 1,194 public tickets that agents attempted, documentation tickets landed clean 57% of the time against 17% for features, but no ranking opened a lane at either budget: the best slice still failed about a third of the time. To reproduce it, [`prep_aidev.py`](prep_aidev.py) converts the AIDev tables (CC BY 4.0, Li, Zhang and Hassan) to the JSONL `agent_lane.py aidev-table` reads; it is the one script here that needs a library, `pyarrow`, and its header has the download commands.
 
 It is written up in [Which tickets can you hand to an agent?](https://thanoskarpouzis.com/writing/2026/agent-lane/).
+
+## Build a test bench from your own fixed issues
+
+`bench.py` turns merged fixes into tasks a coding agent can be scored on, one subcommand per step. The issue as filed is the task; the tests that came with the fix are the judge, and the agent never sees them. Mining and verification need no model; only `run` calls one.
+
+**What it needs.** Python 3 (standard library only on your machine), Docker or [OrbStack](https://orbstack.dev), a read-only GitHub token for mining, and the AI gateway key the rest of the kit uses for runs. A local clone of the repository.
+
+**Once: the harness image.** `bash bench/setup-env.sh` locks [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) (MIT) and its dependencies to releases at least 14 days old with a hash for every file (`bench/harness/lock.py`), builds an image with them inside, creates a Docker network with no route out, and starts a small proxy (`bench/harness/egress_proxy.py`) that is that network's only exit and allows the model gateway alone. It ends with eight checks of that isolation, including two positive controls. Nothing from PyPI is installed on your machine.
+
+**A recipe per repository.** `bench/recipes/pytest-dev__pytest.json` is the example: `repo` and `default_branch`; `test_dirs`, the folder names that hold tests; `requirements` and `constraints`, the test dependencies to lock into the image; `setup`, the command that installs a checkout with no network; `env`; `run_globs` and `run_exclude`, which test files pytest should run; `pytest_args`; `timeout_s`; and `docker` limits for every container (4 cores and 4 GB by default, so a laptop stays usable).
+
+**The steps.**
+
+```sh
+export GITHUB_TOKEN=paste-a-read-only-token
+python3 bench.py mine --repo OWNER/REPO --since YYYY-MM-DD --target 60 --test-dirs tests
+python3 bench.py image --recipe bench/recipes/OWNER__REPO.json
+python3 bench.py split --recipe bench/recipes/OWNER__REPO.json --repo-dir path/to/clone
+python3 bench.py verify --recipe bench/recipes/OWNER__REPO.json --repeats 3
+python3 bench.py freeze --recipe bench/recipes/OWNER__REPO.json
+python3 bench.py packets --recipe bench/recipes/OWNER__REPO.json
+export AI_GATEWAY_API_KEY=paste-your-key
+python3 bench.py run --recipe bench/recipes/OWNER__REPO.json --run-id r1 --spend-cap 25
+python3 bench.py score --recipe bench/recipes/OWNER__REPO.json --run-id r1
+python3 bench.py report --recipe bench/recipes/OWNER__REPO.json --runs r1 r2 --labels labels.jsonl
+```
+
+`mine` keeps merged pull requests since the date (set it after your model's training cutoff) that close exactly one issue, filed by a person before the fix with a real description, and change a test file; it ignores references inside HTML comments, since pull request templates often quote an example. `split` folds backports to maintenance branches into the pull request on the default branch, then splits each fix into its test part (withheld) and its code part. `verify` checks in a fresh container with no network that the touched tests fail before the fix and pass after it, three times; the tests that go from failing to passing must pass for a task to count, and the ones that passed both times must not break. `freeze` writes the survivors to `tasks.json` with a checksum, and `run` refuses to start if the tasks or the image have changed since. `packets` writes one file per task for the fairness screen in [`bench/fairness_prompt.md`](bench/fairness_prompt.md): could a fix written from the issue alone pass these tests? On pytest about half could not. `run` starts a fresh container per task on the private network, gives the harness the issue and the checkout, runs every command the agent chooses as an unprivileged user, caps each task at $1 and 75 model calls (`bench/harness.json`), and checks that the key appears in no file a task leaves behind. `score` applies the agent's changes and the withheld tests. Everything is cached and restartable, and `python3 -m unittest tests/test_bench.py` runs the tests, three of them in the real image on a small fixture repository.
+
+**Choosing a harness to plug in.** The run step is written for mini-swe-agent, the plainest setup available, so that the harness is not the variable. If you want another, check six things first: who makes it and where, its licence, whether it runs unattended from a script, whether it reports cost per task, whether spend can be capped per task, and whether it takes your own model endpoint, which you need if your model calls go through a gateway or a proxy. As checked on 1 November 2026 on each maker's own pages:
+
+| | mini-swe-agent | SWE-agent | OpenHands CLI | Claude Code |
+|---|---|---|---|---|
+| Maker | Princeton and Stanford, US | Princeton and Stanford, US | All Hands AI, US | Anthropic, US |
+| Licence | MIT | MIT | MIT | Proprietary |
+| Unattended | Yes, Python API and batch mode | Yes | Yes, `--headless` | Yes, `-p` |
+| Cost per task | In its trajectory file | Yes | In its metrics | `total_cost_usd` in JSON output |
+| Spend cap per task | `cost_limit` | `per_instance_cost_limit` | `max_budget_per_task` | `--max-budget-usd` |
+| Own model endpoint | Any, through LiteLLM | Any, through LiteLLM | `base_url` | Anthropic-compatible endpoints only |
+
+This is a checklist, not a ranking; capabilities change between releases, so check again before you choose. One lesson from building this: mini-swe-agent writes its model settings into its trajectory file, so a key passed in those settings ends up on disk. The run step removes it there and scans every file a task leaves behind for the key.
+
+**Limits.** The bench measures what the tests check: resolved means the tests pass, not that the code is good or easy to review. At a few dozen tasks the uncertainty is in which tasks you picked more than in which run you got, so compare setups task by task on the same frozen set. A repository whose tests need a compiled core, services or network access needs a richer recipe than a plain container.
 
 ## Reproduce the public benchmarks
 

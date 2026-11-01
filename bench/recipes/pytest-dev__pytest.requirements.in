@@ -1,0 +1,19 @@
+# pytest's test dependencies, from the `dev` extra in its pyproject.toml (read 31 October 2026), plus its build
+# requirements so the checkout can be installed with no network. Installed only in the bench image's /opt/testbed.
+argcomplete
+attrs>=23.1
+coverage>=7.5
+hypothesis>=6.75
+mock
+numpy>=1.26
+pexpect>=4.9
+pytest-xdist>=3.5
+pyyaml
+requests
+setuptools>=77
+setuptools-scm[toml]>=10.1
+xmlschema
+iniconfig>=2
+packaging>=24
+pluggy>=1.6,<2
+pygments>=2.15
