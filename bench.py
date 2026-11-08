@@ -11,11 +11,13 @@ The method, one subcommand per step:
   run      hand each task's issue text to the agent harness in a fresh container and keep the diff it leaves
   score    apply the diff and the withheld tests; resolved when every new test passes and no old one breaks
   report   the funnel, flakiness, two runs side by side, cost, and the predictions; also report.json,
-           every headline figure by name, so a write-up can cite numbers instead of retyping them
+           every headline figure by name, so a write-up can cite numbers instead of retyping them;
+           with --paired, two versions of the tickets read pair by pair over the same tasks
   all      the whole pipeline in one command, restartable, with a log of every step
 
 Standard library only. The run step calls the harness's own Python environment (see bench/setup-env.sh).
-Written up in the third post of the series "Ask your own repository" on thanoskarpouzis.com.
+Written up in the third post of the series "Ask your own repository" on thanoskarpouzis.com; `run --tickets`
+and `report --paired` (with tickets.py) in the fourth.
 """
 import argparse
 import collections
@@ -35,6 +37,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 MIN_BODY_CHARS = 40
+
+# The clear ticket study's predictions (report --study tickets), fixed before any run. Change them here to read
+# your own runs against your own thresholds.
+TICKETS_TITLE_LOSS = 5            # 1. title only loses a net 5 or more tasks against the issue as filed
+TICKETS_REWRITE_GAIN = 3          # 2. the rewritten ticket gains a net 3 or more
+TICKETS_UNFAIR_GAIN_MAX = 1       # 3. ... and a net 1 at most on the tasks the fairness screen labelled unfair
+TICKETS_FIRST_DRAFTS_REJECTED = 5  # 5. the leak check rejects at least 5 first drafts
 
 
 def kit_dir(repo):
@@ -419,12 +428,47 @@ def redact_key(folder, key):
     return found
 
 
+def load_tickets(kd, version, manifest):
+    """A frozen version of the tickets (tickets.py), checked against the task set: made from this manifest,
+    matching its own checksum, one ticket for each task and no other. Raises ValueError otherwise."""
+    path = Path(kd) / "tickets" / f"{version}.json"
+    if not path.exists():
+        raise ValueError(f"no version file {path}; write it with tickets.py first")
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    if doc.get("version") != version:
+        raise ValueError(f"{path} says it is version {doc.get('version')!r}")
+    if doc.get("tasks_checksum") != manifest["checksum"]:
+        raise ValueError(f"{path} was made from a different task set")
+    if canonical_checksum(doc["tickets"]) != doc.get("checksum"):
+        raise ValueError(f"{path} does not match its checksum")
+    want, have = {t["task_id"] for t in manifest["tasks"]}, set(doc["tickets"])
+    if want != have:
+        raise ValueError(f"{path} does not hold one ticket per task: missing {sorted(want - have)[:5]}, "
+                         f"unknown {sorted(have - want)[:5]}")
+    for tid, tk in doc["tickets"].items():
+        if set(tk) != {"issue_title", "issue_body"}:
+            raise ValueError(f"{path}: ticket {tid} must hold issue_title and issue_body only")
+    return doc
+
+
+def tickets_setting(doc):
+    if doc is None:
+        return {"version": "as-filed"}
+    return {"version": doc["version"], "checksum": doc["checksum"], "rule_sha256": doc.get("rule_sha256")}
+
+
 def run_agent(args):
     recipe = load_recipe(args.recipe)
     kd = kit_dir(recipe["repo"])
     manifest = json.loads((kd / "tasks.json").read_text(encoding="utf-8"))
     if canonical_checksum(manifest["tasks"]) != manifest["checksum"]:
         sys.exit("tasks.json does not match its checksum")
+    doc = None
+    if getattr(args, "tickets", None):
+        try:
+            doc = load_tickets(kd, args.tickets, manifest)
+        except ValueError as e:
+            sys.exit(str(e))
     if image_id(recipe["image"]) != manifest["image_id"]:
         sys.exit("the bench image is not the one the tasks were frozen with")
     cfg = json.loads((BENCH / "harness.json").read_text(encoding="utf-8"))
@@ -435,9 +479,18 @@ def run_agent(args):
         cfg["agent"]["cost_limit"] = args.cost_cap
     run_dir = kd / "runs" / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    tickets = tickets_setting(doc)
+    old = run_dir / "settings.json"
+    if old.exists() and list(run_dir.glob("*/result.json")):
+        was = json.loads(old.read_text(encoding="utf-8")).get("tickets", {"version": "as-filed"})
+        if was != tickets:
+            sys.exit(f"run {args.run_id} was started with tickets {was}; it cannot resume with {tickets}")
     (run_dir / "settings.json").write_text(json.dumps({"harness": cfg, "image_id": manifest["image_id"],
-                                                       "tasks_checksum": manifest["checksum"]}, indent=2))
+                                                       "tasks_checksum": manifest["checksum"],
+                                                       "tickets": tickets}, indent=2))
     tasks = manifest["tasks"]
+    if doc is not None:  # the only thing a version changes: the title and body the agent is handed
+        tasks = [{**t, **doc["tickets"][t["task_id"]]} for t in tasks]
     if args.only:
         tasks = [t for t in tasks if t["task_id"] in args.only.split(",")]
     for t in tasks:
@@ -701,12 +754,112 @@ def report_figures(repo, mine_m, split_m, verify_m, run_ids, runs, labels=None):
     return fig
 
 
+def paired_figures(versions, groups, labels=None):
+    """Two versions of the tickets read pair by pair over the same tasks. groups[i] is a list of (run id, scored
+    rows) for version i, two runs each. Per task a version scores 1 when resolved in every run, a half when in one
+    of two, 0 in none; `only_b` is the sum of how much B beats A per task, `only_a` the reverse, `both` and
+    `neither` the overlap, so the four add up to the task count and net = only_b - only_a. Pure."""
+    def score_of(group):
+        per = collections.defaultdict(list)
+        for _rid, rs in group:
+            for r in rs:
+                per[r["task_id"]].append(bool(r["resolved"]))
+        return {t: (sum(v), len(v)) for t, v in per.items()}
+
+    sa, sb = score_of(groups[0]), score_of(groups[1])
+    common = sorted(set(sa) & set(sb))
+
+    def split(ids):
+        c = {"tasks": len(ids), "both": 0.0, "neither": 0.0, "only_a": 0.0, "only_b": 0.0}
+        for t in ids:
+            a, b = sa[t][0] / sa[t][1], sb[t][0] / sb[t][1]
+            c["both"] += min(a, b)
+            c["neither"] += min(1 - a, 1 - b)
+            c["only_a"] += max(a - b, 0)
+            c["only_b"] += max(b - a, 0)
+        c = {k: (round(v, 2) if isinstance(v, float) else v) for k, v in c.items()}
+        c["net_b_minus_a"] = round(c["only_b"] - c["only_a"], 2)
+        return c
+
+    out = {"a": versions[0], "b": versions[1], "runs_a": [rid for rid, _ in groups[0]],
+           "runs_b": [rid for rid, _ in groups[1]], **split(common)}
+    if labels:
+        for label in ("fair", "unfair", "unclear"):
+            ids = [t for t in common if labels.get(t) == label]
+            if ids:
+                out[label] = split(ids)
+    out["runs"] = {}
+    for rid, rs in groups[0] + groups[1]:
+        f = run_figures(rs)
+        out["runs"][rid] = {"resolved": f["resolved"], "tasks": f["tasks"], "cost_total": f["cost_total"],
+                            "cost_per_resolved": round(f["cost_total"] / f["resolved"], 3) if f["resolved"] else None,
+                            "resolved_interval_pct": f["resolved_interval_pct"], "capped": f["capped"],
+                            "cost_median": f["cost_median"], "calls_median": f["calls_median"],
+                            "tokens_input": f["tokens_input"], "tokens_output": f["tokens_output"]}
+    out["per_task"] = [{"task_id": t, "a": sa[t][0], "b": sb[t][0], "of": sa[t][1], "label": (labels or {}).get(t)}
+                       for t in common]
+    return out
+
+
+def ticket_predictions(paired, rewrite_counts=None):
+    """The clear ticket study's five predictions, from paired blocks whose A side is the issue as filed."""
+    by = {p["b"]: p for p in paired if p["a"] == "as-filed"}
+    out = []
+    t, w = by.get("title-only"), by.get("rewritten")
+    if t:
+        out.append((f"1. Title only loses a net {TICKETS_TITLE_LOSS} or more", t["net_b_minus_a"] <= -TICKETS_TITLE_LOSS,
+                    f"net {t['net_b_minus_a']:+g} of {t['tasks']}"))
+    if w:
+        out.append((f"2. Rewritten gains a net {TICKETS_REWRITE_GAIN} or more", w["net_b_minus_a"] >= TICKETS_REWRITE_GAIN,
+                    f"net {w['net_b_minus_a']:+g} of {w['tasks']}"))
+        if "unfair" in w:
+            u = w["unfair"]
+            out.append((f"3. On unfair tasks the rewritten gain is a net {TICKETS_UNFAIR_GAIN_MAX} at most",
+                        u["net_b_minus_a"] <= TICKETS_UNFAIR_GAIN_MAX, f"net {u['net_b_minus_a']:+g} of {u['tasks']} unfair"
+                        + (f"; fair net {w['fair']['net_b_minus_a']:+g} of {w['fair']['tasks']}" if "fair" in w else "")))
+    if t or w:
+        p = t or w
+        inf = float("inf")  # a run that resolves nothing costs without limit per resolved task
+        def per(pair, side):
+            return [pair["runs"][r]["cost_per_resolved"] for r in pair["runs_" + side]]
+        base = per(p, "a")
+        b_inf = [inf if c is None else c for c in base]
+        ok, txt = True, [f"as filed {base}"]
+        if w:
+            cw = per(w, "b")
+            ok = ok and max(inf if c is None else c for c in cw) < min(b_inf)
+            txt.append(f"rewritten {cw}")
+        if t:
+            ct = per(t, "b")
+            ok = ok and min(inf if c is None else c for c in ct) > max(b_inf)
+            txt.append(f"title only {ct}")
+        out.append(("4. Cost per resolved task: rewritten lower than as filed, title only higher, in every run",
+                    ok, "; ".join(txt)))
+    if rewrite_counts:
+        n = rewrite_counts["first_draft_rejected"]
+        out.append((f"5. The leak check rejects at least {TICKETS_FIRST_DRAFTS_REJECTED} first drafts",
+                    n >= TICKETS_FIRST_DRAFTS_REJECTED,
+                    f"{n} first drafts rejected, {rewrite_counts['second_draft_rejected']} second, "
+                    f"{rewrite_counts['fallbacks']} fell back"))
+    return out
+
+
+def run_version(run_dir):
+    f = Path(run_dir) / "settings.json"
+    if not f.exists():
+        return "as-filed"
+    return json.loads(f.read_text(encoding="utf-8")).get("tickets", {}).get("version", "as-filed")
+
+
 def report(args):
     recipe = load_recipe(args.recipe)
     kd = kit_dir(recipe["repo"])
     mine_m = json.loads((kd / "mine-manifest.json").read_text(encoding="utf-8"))
     split_m = json.loads((kd / "split-manifest.json").read_text(encoding="utf-8"))
     verify_m = json.loads((kd / "verify-manifest.json").read_text(encoding="utf-8"))
+    paired_groups = [[g.split(",") for g in pair] for pair in (getattr(args, "paired", None) or [])]
+    if paired_groups and not args.runs:
+        args.runs = list(dict.fromkeys(rid for pair in paired_groups for g in pair for rid in g))
     runs = [read_jsonl(kd / "runs" / rid / "score.jsonl") for rid in args.runs]
     L = [f"# Bench report: {recipe['repo']}", "", "## Funnel", "",
          f"Pull requests merged since {mine_m['merged_since']}, seen: {mine_m['pull_requests_seen']}",
@@ -737,13 +890,60 @@ def report(args):
                 cells = [f"{sum(r['resolved'] for r in rs if r['task_id'] in ids)} of {len(ids)}" for rs in runs]
                 L.append(f"| {label} | " + " | ".join(cells) + " |")
         L.append("")
+    labels = {j["task_id"]: j["label"] for j in read_jsonl(args.labels)} if args.labels else None
+    paired = []
+    for pair in paired_groups:
+        versions, groups = [], []
+        for g in pair:
+            vs = {run_version(kd / "runs" / rid) for rid in g}
+            if len(vs) != 1:
+                sys.exit(f"runs {g} were made with different tickets {sorted(vs)}; a group is one version")
+            versions.append(vs.pop())
+            groups.append([(rid, read_jsonl(kd / "runs" / rid / "score.jsonl")) for rid in g])
+        p = paired_figures(versions, groups, labels)
+        paired.append(p)
+        L += [f"## Paired: {p['b']} ({', '.join(p['runs_b'])}) against {p['a']} ({', '.join(p['runs_a'])})", "",
+              "Per task a version scores 1 when resolved in both its runs, a half in one of two.", "",
+              "| tasks | n | both | neither | only " + p["a"] + " | only " + p["b"] + " | net |", "|---|---|---|---|---|---|---|"]
+        for name in ("all", "fair", "unfair", "unclear"):
+            c = p if name == "all" else p.get(name)
+            if c:
+                L.append(f"| {name} | {c['tasks']} | {c['both']:g} | {c['neither']:g} | {c['only_a']:g} | "
+                         f"{c['only_b']:g} | {c['net_b_minus_a']:+g} |")
+        L += ["", "| run | version | resolved | 95% interval | total | per resolved | median per task | capped |",
+              "|---|---|---|---|---|---|---|---|"]
+        for side, ids in ((p["a"], p["runs_a"]), (p["b"], p["runs_b"])):
+            for rid in ids:
+                f = p["runs"][rid]
+                iv = f["resolved_interval_pct"] or [None, None]
+                per = f"${f['cost_per_resolved']:.3f}" if f["cost_per_resolved"] is not None else "n/a"
+                L.append(f"| {rid} | {side} | {f['resolved']} of {f['tasks']} | {iv[0]} to {iv[1]}% | "
+                         f"${f['cost_total']:.2f} | {per} | ${f['cost_median']:.3f} | {f['capped']} |")
+        L += ["", "| task | label | " + p["a"] + " | " + p["b"] + " |", "|---|---|---|---|"]
+        L += [f"| {r['task_id']} | {r['label'] or ''} | {r['a']} of {r['of']} | {r['b']} of {r['of']} |"
+              for r in p["per_task"] if r["a"] != r["b"]]
+        L.append("")
+    study = getattr(args, "study", None)
+    rewrite_counts = None
+    if study == "tickets":
+        f = kd / "tickets" / "rewritten.json"
+        if f.exists():
+            rewrite_counts = json.loads(f.read_text(encoding="utf-8")).get("rewrite")
+        preds = ticket_predictions(paired, rewrite_counts)
+    else:
+        preds = predictions(mine_m, split_m, verify_m, runs)
     L += ["## Predictions", ""]
-    preds = predictions(mine_m, split_m, verify_m, runs)
     L += [f"- {name}: {'HELD' if held else 'FAILED'} ({detail})" for name, held, detail in preds]
     out = Path(args.out) if args.out else kd / "report.md"
     out.write_text("\n".join(L) + "\n", encoding="utf-8")
-    labels = {j["task_id"]: j["label"] for j in read_jsonl(args.labels)} if args.labels else None
     fig = report_figures(recipe["repo"], mine_m, split_m, verify_m, list(args.runs), runs, labels)
+    if paired:
+        fig["paired"] = paired
+    if study == "tickets":
+        fig["study"] = "tickets"
+        fig["rewrite"] = rewrite_counts
+        fig["predictions"] = [{"name": name, "verdict": "held" if held else "failed", "detail": detail}
+                              for name, held, detail in preds]
     out_json = out.with_suffix(".json")
     out_json.write_text(json.dumps(fig, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print("\n".join(f"{name}: {'HELD' if held else 'FAILED'} ({detail})" for name, held, detail in preds))
@@ -850,6 +1050,8 @@ def main(argv=None):
     p.add_argument("--cost-cap", type=float, help="dollars per task; default from bench/harness.json")
     p.add_argument("--spend-cap", type=float, default=50.0, help="dollars for the whole run folder")
     p.add_argument("--only", help="comma-separated task ids")
+    p.add_argument("--tickets", help="hand the agent a frozen version of the tickets (tickets.py), e.g. rewritten; "
+                                     "default the issue as filed")
     p.set_defaults(func=run_agent)
 
     p = sub.add_parser("score", help="score a run with the withheld tests")
@@ -868,6 +1070,10 @@ def main(argv=None):
     p.add_argument("--runs", nargs="*", default=[])
     p.add_argument("--labels", help="fairness labels, one JSON object per line with task_id and label")
     p.add_argument("--out")
+    p.add_argument("--paired", nargs=2, action="append", metavar=("A1,A2", "B1,B2"),
+                   help="two groups of run ids, one version of the tickets each, read pair by pair; may repeat")
+    p.add_argument("--study", choices=["bench", "tickets"], default="bench",
+                   help="which study's predictions to report (default bench, the third post's)")
     p.set_defaults(func=report)
 
     p = sub.add_parser("verdict", help="the predictions alone")

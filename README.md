@@ -27,6 +27,8 @@ A sixth tool, [`agent_lane.py`](#which-tickets-can-you-hand-to-an-agent), asks w
 
 A seventh tool, [`bench.py`](#build-a-test-bench-from-your-own-fixed-issues), turns your repository's fixed issues into a small private benchmark for coding agents, with the checks that make each task trustworthy, and runs an agent setup on it. It is written up in [Can your own history be your benchmark?](https://thanoskarpouzis.com/writing/2026/test-bench/).
 
+An eighth tool, [`tickets.py`](#vary-the-ticket-not-the-setup), prices the wording of a ticket on that bench: the title alone, the ticket as filed, and the ticket rewritten with acceptance criteria by a published rule that a leak check verifies, run in pairs over the same tasks. It is written up in [Does a better ticket beat a better setup?](https://thanoskarpouzis.com/writing/2026/ticket-wording/).
+
 ## What you need
 
 - Python 3. The scripts use the standard library only, so there is nothing to install. The one exception is `prep_aidev.py`, which converts a public dataset once and needs `pyarrow`.
@@ -257,6 +259,25 @@ python3 bench.py all --recipe bench/recipes/OWNER__REPO.json --repo-dir path/to/
 This is a checklist, not a ranking; capabilities change between releases, so check again before you choose. One lesson from building this: mini-swe-agent writes its model settings into its trajectory file, so a key passed in those settings ends up on disk. The run step removes it there and scans every file a task leaves behind for the key.
 
 **Limits.** The bench measures what the tests check: resolved means the tests pass, not that the code is good or easy to review. At a few dozen tasks the uncertainty is in which tasks you picked more than in which run you got, so compare setups task by task on the same frozen set. A repository whose tests need a compiled core, services or network access needs a richer recipe than a plain container.
+
+## Vary the ticket, not the setup
+
+`tickets.py` writes versions of each frozen task's ticket, so that a run can change the text the agent is handed and nothing else. Three versions: `title-only` (the issue title as frozen, no body), as filed (what `bench.py run` already hands over), and `rewritten`, the issue restated under six fixed headings with acceptance criteria by the rule in [`bench/rewrite_rule.md`](bench/rewrite_rule.md), applied by the same model as the agent with the issue text as its only input. The rule forbids proposing a solution, naming anything the issue does not name, and resolving an open question by choosing; every criterion ends with a quotation of the issue sentence it traces to. It doubles as a checklist for writing tickets by hand.
+
+**The leak check.** `tickets.leaks` pulls the code-like tokens out of a rewrite (backticked spans and fenced code, dotted or underscored names, CamelCase names, flags, quoted strings of two words or more) and requires each to occur in the issue as filed; the repository's name and the heading words are allowed. `rewrite` runs it on every draft: a draft that fails is sent back once with the offending tokens named, and a second failure keeps the as-filed text for that task and counts it, so a leak never reaches the agent. The log (`tickets/rewrite-log.jsonl`) keeps every draft, verdict, cost and time. The check is deliberately strict: it also refuses an exact quotation from the issue that has a backticked name inside it, which costs a retry and never a leak. It cannot see a reporter's suggestion turned into a requirement; for that, read five rewrites against their issues by hand before you run.
+
+```sh
+python3 tickets.py title-only --recipe bench/recipes/OWNER__REPO.json
+export AI_GATEWAY_API_KEY=paste-your-key
+python3 tickets.py rewrite --recipe bench/recipes/OWNER__REPO.json --spend-cap 5
+python3 tickets.py check --recipe bench/recipes/OWNER__REPO.json --version rewritten
+python3 tickets.py freeze --recipe bench/recipes/OWNER__REPO.json
+python3 bench.py run --recipe bench/recipes/OWNER__REPO.json --tickets title-only --run-id t1 --spend-cap 25
+python3 bench.py run --recipe bench/recipes/OWNER__REPO.json --tickets rewritten --run-id w1 --spend-cap 25
+python3 bench.py report --recipe bench/recipes/OWNER__REPO.json --paired r1,r2 t1,t2 --paired r1,r2 w1,w2 --labels labels.jsonl --study tickets --out kit/bench/OWNER__REPO/report-tickets.md
+```
+
+`freeze` writes `tickets/rewritten.json` with the rule's checksum, the task set's checksum and its own, and refuses if any task is missing or any final ticket fails the check. `run --tickets` checks the version file against the frozen manifest, hands its title and body to the agent in place of the issue, and records the version and checksum in the run's `settings.json`. `report --paired` reads two runs of each version pair by pair over the same tasks: per task a version scores 1 when resolved in both runs and a half in one of two; the report gives both, neither, only one each way and the net, the same split by the fairness labels, cost per resolved task and the interval on each run, and with `--study tickets` the five predictions of the fourth post. `python3 -m unittest tests/test_tickets.py` covers the versions, the leak check, the rewriter with a fake model, the version check in `run` and the paired figures, with no Docker and no model calls. On pytest, a round of 44 rewrites cost about $1 and eight minutes, and each run of 44 tasks $8 to $10.
 
 ## Reproduce the public benchmarks
 
