@@ -12,19 +12,25 @@ The method, one subcommand per step:
   score    apply the diff and the withheld tests; resolved when every new test passes and no old one breaks
   report   the funnel, flakiness, two runs side by side, cost, and the predictions; also report.json,
            every headline figure by name, so a write-up can cite numbers instead of retyping them;
-           with --paired, two versions of the tickets read pair by pair over the same tasks
+           with --paired, two versions of the tickets read pair by pair over the same tasks; with --noise, the
+           flips between identical runs, the split nets and the noise floor; with --study context, the context file
+           study's report-context.md and .json
   all      the whole pipeline in one command, restartable, with a log of every step
 
 Standard library only. The run step calls the harness's own Python environment (see bench/setup-env.sh).
 Written up in the third post of the series "Ask your own repository" on thanoskarpouzis.com; `run --tickets`
-and `report --paired` (with tickets.py) in the fourth.
+and `report --paired` (with tickets.py) in the fourth; `run --harness`, `run --context`, `run --label`,
+`report --noise` and `report --study context` (with context.py) in the fifth.
 """
 import argparse
 import collections
 import hashlib
+import itertools
 import json
+import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -44,6 +50,23 @@ TICKETS_TITLE_LOSS = 5            # 1. title only loses a net 5 or more tasks ag
 TICKETS_REWRITE_GAIN = 3          # 2. the rewritten ticket gains a net 3 or more
 TICKETS_UNFAIR_GAIN_MAX = 1       # 3. ... and a net 1 at most on the tasks the fairness screen labelled unfair
 TICKETS_FIRST_DRAFTS_REJECTED = 5  # 5. the leak check rejects at least 5 first drafts
+
+# The context file study's rules (report --study context), fixed in its spec before any run. The floor is
+# NOISE_SDS standard deviations of the net between two arms when nothing differs, from the mean flips F between
+# two single no-file runs: sd = sqrt((F/2) * (1/a + 1/b)) for arms of a and b runs.
+CONTEXT_PILOT_MIN = 10            # the pilot gate: n1 resolves at least 10 tasks or the study stops
+CONTEXT_COST_RATIO = 1.15         # 3. the generated arm's median per-task cost ratio is at least this
+CONTEXT_TEST_RUNNER_GAIN = 1      # 4. each context arm runs at least 1 more test-runner command per task (median)
+CONTEXT_SINGLE_RUN_SPAN = 2       # 5. the eight single-run gaps span at least 2 tasks (or change sign)
+CONTEXT_VALIDATION_NET = 3        # the pool's net agrees when within 3 of zero (inside) or beyond 3 (outside)
+NOISE_SDS = 2
+CONTEXT_POINTS = (2, 5, 10)       # what the bench can see: tasks and repeats needed for these differences
+CONTEXT_NONE_RUNS = ("n1", "n2", "n3", "n4")
+CONTEXT_ARMS = {"project-docs": ("d1", "d2"), "generated": ("g1", "g2")}
+CONTEXT_POOL = {"project-docs": "vd1", "generated": "vg1"}
+CONTEXT_POOL_BASE = ("r1", "r2")  # post 3's runs, the pool's no-file side
+CONTEXT_POOL_LABEL = "fair"
+TEST_RUNNERS = ("pytest", "py.test", "tox")  # as programs; `python -m pytest` counts too
 
 
 def kit_dir(repo):
@@ -457,6 +480,78 @@ def tickets_setting(doc):
     return {"version": doc["version"], "checksum": doc["checksum"], "rule_sha256": doc.get("rule_sha256")}
 
 
+def load_context(kd, name, manifest):
+    """A frozen context file (context.py freeze), checked against the task set: the file matches the checksum in
+    its freeze record, the record was made from this manifest, and its leak check passed. Raises ValueError
+    otherwise. Returns the record with the file's text under `text`."""
+    path, text_path = Path(kd) / "context" / f"{name}.json", Path(kd) / "context" / f"{name}.md"
+    if not path.exists():
+        raise ValueError(f"no frozen context file {path}; freeze it with context.py first")
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    if doc.get("name") != name:
+        raise ValueError(f"{path} says it is {doc.get('name')!r}")
+    if doc.get("tasks_checksum") != manifest["checksum"]:
+        raise ValueError(f"{path} was made from a different task set")
+    if not text_path.exists() or sha256_file(text_path) != doc.get("sha256"):
+        raise ValueError(f"{text_path} does not match the checksum it was frozen with")
+    if not (doc.get("check") or {}).get("leak_passed"):
+        raise ValueError(f"{path} did not pass the leak check")
+    return {**doc, "text": text_path.read_text(encoding="utf-8")}
+
+
+def context_setting(doc):
+    if doc is None:
+        return {"name": "none"}
+    return {"name": doc["name"], "sha256": doc["sha256"]}
+
+
+def load_labels(path):
+    return {j["task_id"]: j["label"] for j in read_jsonl(path)}
+
+
+def agent_container(recipe, cfg, name, checkout, meta, tdir, key, files=None):
+    """One harness session in a fresh task container: the checkout, meta.json, the harness settings and any extra
+    files in /task, the key on standard input, then everything the runner wrote to /out copied into tdir. Shared
+    by the run step and by context.py generate. Returns result.json, written here if the runner left none."""
+    run(["docker", "rm", "-f", name], check=False)
+    with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
+        tp = Path(tmp)
+        shutil.copyfile(checkout, tp / "checkout.tar")
+        (tp / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        for fname, text in (files or {}).items():
+            (tp / fname).write_text(text, encoding="utf-8")
+        hcfg = tp / "harness.json"
+        hcfg.write_text(json.dumps(cfg), encoding="utf-8")
+        run(["docker", "create", "-i", "--name", name, "--network", cfg["environment"]["network"],
+             *docker_limits(recipe), "-v", f"{tp}:/task:ro", "-v", f"{BENCH / 'runner'}:/runner:ro",
+             "-v", f"{hcfg}:/bench/harness.json:ro", recipe["image"],
+             "/opt/harness/bin/python", "/runner/run_task.py"])
+        since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        try:
+            r = run(["docker", "start", "-ai", name], check=False, inp=json.dumps({"api_key": key}) + "\n",
+                    timeout=cfg["wall_time_limit_s"])
+            (tdir / "container.log").write_text((r.stdout or "") + (r.stderr or ""), encoding="utf-8")
+        except subprocess.TimeoutExpired:
+            run(["docker", "kill", name], check=False)
+            (tdir / "container.log").write_text("killed: wall time limit\n", encoding="utf-8")
+        run(["docker", "cp", f"{name}:/out/.", str(tdir)], check=False)
+        run(["docker", "rm", "-f", name], check=False)
+    leaked = redact_key(tdir, key)
+    if leaked:
+        print(f"  WARNING: the key was found in {leaked} and has been redacted there; tell Claude", flush=True)
+    egress = run(["docker", "logs", "--since", since + "Z", "bench-egress"], check=False)
+    (tdir / "egress.jsonl").write_text((egress.stdout or "") + (egress.stderr or ""), encoding="utf-8")
+    if not (tdir / "result.json").exists():
+        (tdir / "result.json").write_text(json.dumps({"task_id": meta["task_id"], "exit_status": "no result",
+                                                      "cost": None}), encoding="utf-8")
+    return json.loads((tdir / "result.json").read_text(encoding="utf-8"))
+
+
+def load_harness(path=None):
+    """The harness settings: bench/harness.json unless another file is named (bench/harness.haiku.json)."""
+    return json.loads(Path(path or BENCH / "harness.json").read_text(encoding="utf-8"))
+
+
 def run_agent(args):
     recipe = load_recipe(args.recipe)
     kd = kit_dir(recipe["repo"])
@@ -469,9 +564,22 @@ def run_agent(args):
             doc = load_tickets(kd, args.tickets, manifest)
         except ValueError as e:
             sys.exit(str(e))
+    ctx = None
+    if getattr(args, "context", None):
+        try:
+            ctx = load_context(kd, args.context, manifest)
+        except ValueError as e:
+            sys.exit(str(e))
+    label = getattr(args, "label", None)
+    labels = None
+    if label:
+        lpath = kd / "fairness" / "labels.jsonl"
+        labels = load_labels(lpath)
+        if not any(v == label for v in labels.values()):
+            sys.exit(f"no task carries the label {label!r} in {lpath}")
     if image_id(recipe["image"]) != manifest["image_id"]:
         sys.exit("the bench image is not the one the tasks were frozen with")
-    cfg = json.loads((BENCH / "harness.json").read_text(encoding="utf-8"))
+    cfg = load_harness(getattr(args, "harness", None))
     key = os.environ.get(cfg["model"]["api_key_env"])
     if not key:
         sys.exit(f"set {cfg['model']['api_key_env']} in this shell first")
@@ -480,17 +588,32 @@ def run_agent(args):
     run_dir = kd / "runs" / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     tickets = tickets_setting(doc)
+    context = context_setting(ctx)
     old = run_dir / "settings.json"
     if old.exists() and list(run_dir.glob("*/result.json")):
-        was = json.loads(old.read_text(encoding="utf-8")).get("tickets", {"version": "as-filed"})
+        prev = json.loads(old.read_text(encoding="utf-8"))
+        was = prev.get("tickets", {"version": "as-filed"})
         if was != tickets:
             sys.exit(f"run {args.run_id} was started with tickets {was}; it cannot resume with {tickets}")
-    (run_dir / "settings.json").write_text(json.dumps({"harness": cfg, "image_id": manifest["image_id"],
-                                                       "tasks_checksum": manifest["checksum"],
-                                                       "tickets": tickets}, indent=2))
+        was = prev.get("context", {"name": "none"})
+        if was != context:
+            sys.exit(f"run {args.run_id} was started with context file {was}; it cannot resume with {context}")
+        was = prev.get("harness", {}).get("model", {}).get("model_name")
+        if was != cfg["model"]["model_name"]:
+            sys.exit(f"run {args.run_id} was started with the model {was}; it cannot resume with "
+                     f"{cfg['model']['model_name']}")
+        if prev.get("label") != label:
+            sys.exit(f"run {args.run_id} was started with the label {prev.get('label')}; it cannot resume with {label}")
+    settings = {"harness": cfg, "image_id": manifest["image_id"], "tasks_checksum": manifest["checksum"],
+                "tickets": tickets, "context": context}
+    if label:
+        settings["label"] = label
+    (run_dir / "settings.json").write_text(json.dumps(settings, indent=2))
     tasks = manifest["tasks"]
     if doc is not None:  # the only thing a version changes: the title and body the agent is handed
         tasks = [{**t, **doc["tickets"][t["task_id"]]} for t in tasks]
+    if labels is not None:
+        tasks = [t for t in tasks if labels.get(t["task_id"]) == label]
     if args.only:
         tasks = [t for t in tasks if t["task_id"] in args.only.split(",")]
     for t in tasks:
@@ -502,40 +625,14 @@ def run_agent(args):
             break
         tdir.mkdir(parents=True, exist_ok=True)
         name = f"bench-{args.run_id}-{t['task_id']}".replace("_", "-")[:120]
-        run(["docker", "rm", "-f", name], check=False)
-        with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
-            tp = Path(tmp)
-            shutil.copyfile(kd / "archives" / f"{t['task_id']}.tar", tp / "checkout.tar")
-            (tp / "meta.json").write_text(json.dumps(task_meta(recipe, t)), encoding="utf-8")
-            hcfg = tp / "harness.json"
-            hcfg.write_text(json.dumps(cfg), encoding="utf-8")
-            run(["docker", "create", "-i", "--name", name, "--network", cfg["environment"]["network"],
-                 *docker_limits(recipe), "-v", f"{tp}:/task:ro", "-v", f"{BENCH / 'runner'}:/runner:ro",
-                 "-v", f"{hcfg}:/bench/harness.json:ro", recipe["image"],
-                 "/opt/harness/bin/python", "/runner/run_task.py"])
-            since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-            try:
-                r = run(["docker", "start", "-ai", name], check=False, inp=json.dumps({"api_key": key}) + "\n",
-                        timeout=cfg["wall_time_limit_s"])
-                (tdir / "container.log").write_text((r.stdout or "") + (r.stderr or ""), encoding="utf-8")
-            except subprocess.TimeoutExpired:
-                run(["docker", "kill", name], check=False)
-                (tdir / "container.log").write_text("killed: wall time limit\n", encoding="utf-8")
-            run(["docker", "cp", f"{name}:/out/.", str(tdir)], check=False)
-            run(["docker", "rm", "-f", name], check=False)
-        leaked = redact_key(tdir, key)
-        if leaked:
-            print(f"  WARNING: the key was found in {leaked} and has been redacted there; tell Claude", flush=True)
-        egress = run(["docker", "logs", "--since", since + "Z", "bench-egress"], check=False)
-        (tdir / "egress.jsonl").write_text((egress.stdout or "") + (egress.stderr or ""), encoding="utf-8")
-        if not (tdir / "result.json").exists():
-            (tdir / "result.json").write_text(json.dumps({"task_id": t["task_id"], "exit_status": "no result",
-                                                          "cost": None}), encoding="utf-8")
-        res = json.loads((tdir / "result.json").read_text(encoding="utf-8"))
+        meta, files = task_meta(recipe, t), None
+        if ctx is not None:  # the file goes to the runner beside the task, never into the working tree
+            meta["context"] = {"name": ctx["name"], "sha256": ctx["sha256"], "path": "/task/context.md"}
+            files = {"context.md": ctx["text"]}
+        res = agent_container(recipe, cfg, name, kd / "archives" / f"{t['task_id']}.tar", meta, tdir, key, files)
         print(f"{t['task_id']}: {res.get('exit_status')} ${res.get('cost') or 0:.3f} "
               f"{res.get('api_calls')} calls {res.get('wall_s')}s (run total ${spent(run_dir):.2f})", flush=True)
     print(f"done: run {args.run_id}, {len(list(run_dir.glob('*/result.json')))} tasks, ${spent(run_dir):.2f} spent")
-
 
 # ---------------------------------------------------------------------------- score
 
@@ -854,6 +951,11 @@ def run_version(run_dir):
 def report(args):
     recipe = load_recipe(args.recipe)
     kd = kit_dir(recipe["repo"])
+    if getattr(args, "study", None) == "context":
+        if not args.labels:
+            sys.exit("report --study context needs --labels (the fairness labels: the fair and unfair split and the pool)")
+        context_report(args, recipe, kd, load_labels(args.labels))
+        return
     mine_m = json.loads((kd / "mine-manifest.json").read_text(encoding="utf-8"))
     split_m = json.loads((kd / "split-manifest.json").read_text(encoding="utf-8"))
     verify_m = json.loads((kd / "verify-manifest.json").read_text(encoding="utf-8"))
@@ -891,6 +993,11 @@ def report(args):
                 L.append(f"| {label} | " + " | ".join(cells) + " |")
         L.append("")
     labels = {j["task_id"]: j["label"] for j in read_jsonl(args.labels)} if args.labels else None
+    subset = None
+    if getattr(args, "label", None):
+        if not labels:
+            sys.exit("--label needs --labels")
+        subset = {t for t, v in labels.items() if v == args.label}
     paired = []
     for pair in paired_groups:
         versions, groups = [], []
@@ -900,6 +1007,13 @@ def report(args):
                 sys.exit(f"runs {g} were made with different tickets {sorted(vs)}; a group is one version")
             versions.append(vs.pop())
             groups.append([(rid, read_jsonl(kd / "runs" / rid / "score.jsonl")) for rid in g])
+        both = [x for grp in groups for x in grp]
+        why = pairing_problem({rid: run_settings(kd / "runs" / rid) for rid, _ in both},
+                              {rid: {r["task_id"] for r in rows} for rid, rows in both}, subset)
+        if why:
+            sys.exit(why)
+        if subset is not None:
+            groups = [restrict(grp, subset) for grp in groups]
         p = paired_figures(versions, groups, labels)
         paired.append(p)
         L += [f"## Paired: {p['b']} ({', '.join(p['runs_b'])}) against {p['a']} ({', '.join(p['runs_a'])})", "",
@@ -923,6 +1037,17 @@ def report(args):
         L += [f"| {r['task_id']} | {r['label'] or ''} | {r['a']} of {r['of']} | {r['b']} of {r['of']} |"
               for r in p["per_task"] if r["a"] != r["b"]]
         L.append("")
+    noise = None
+    if getattr(args, "noise", None):
+        group = [(rid, read_jsonl(kd / "runs" / rid / "score.jsonl")) for rid in args.noise.split(",")]
+        why = pairing_problem({rid: run_settings(kd / "runs" / rid) for rid, _ in group},
+                              {rid: {r["task_id"] for r in rows} for rid, rows in group}, subset)
+        if why:
+            sys.exit(why)
+        if subset is not None:
+            group = restrict(group, subset)
+        noise = noise_figures(group)
+        L += noise_lines(noise)
     study = getattr(args, "study", None)
     rewrite_counts = None
     if study == "tickets":
@@ -934,11 +1059,14 @@ def report(args):
         preds = predictions(mine_m, split_m, verify_m, runs)
     L += ["## Predictions", ""]
     L += [f"- {name}: {'HELD' if held else 'FAILED'} ({detail})" for name, held, detail in preds]
-    out = Path(args.out) if args.out else kd / "report.md"
+    # a noise report asked for on its own must not overwrite the bench's report, so it gets its own default name
+    out = Path(args.out) if args.out else kd / ("report-noise.md" if noise is not None else "report.md")
     out.write_text("\n".join(L) + "\n", encoding="utf-8")
     fig = report_figures(recipe["repo"], mine_m, split_m, verify_m, list(args.runs), runs, labels)
     if paired:
         fig["paired"] = paired
+    if noise is not None:
+        fig["noise"] = noise
     if study == "tickets":
         fig["study"] = "tickets"
         fig["rewrite"] = rewrite_counts
@@ -948,6 +1076,724 @@ def report(args):
     out_json.write_text(json.dumps(fig, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print("\n".join(f"{name}: {'HELD' if held else 'FAILED'} ({detail})" for name, held, detail in preds))
     print(f"wrote {out} and {out_json}")
+
+
+# ---------------------------------------------------------------------------- the context file study (post 5)
+
+def agent_commands(trajectory):
+    """Every command the agent chose, in order, one per tool call: messages[].tool_calls[].function.arguments is
+    a JSON string with a `command` key."""
+    out = []
+    for m in trajectory.get("messages") or []:
+        for tc in m.get("tool_calls") or []:
+            try:
+                a = json.loads((tc.get("function") or {}).get("arguments") or "{}")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(a, dict) and isinstance(a.get("command"), str):
+                out.append(a["command"])
+    return out
+
+
+def call_usages(trajectory):
+    """The usage of each model call, as run_task.py recorded it on the agent's messages."""
+    return [m["extra"]["usage"] for m in trajectory.get("messages") or []
+            if m.get("role") == "assistant" and (m.get("extra") or {}).get("usage")]
+
+
+OPERATORS = set(";&|()")
+WRAPPERS = {"timeout", "env", "time", "nice", "nohup", "sudo", "exec", "xargs", "stdbuf", "uv"}
+WRAPPER_ARGS = {"timeout": 1, "uv": 1}  # words after the options that are not the program (`timeout 60 pytest`, `uv run`)
+OPTION_ARGS = {"-n", "-I", "-P", "-L", "-d", "-s", "-E", "-u", "-k", "-o", "-e", "-i"}
+SHELLS = {"bash", "sh", "zsh", "dash"}
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+PYTHON = re.compile(r"^python(\d+(\.\d+)?)?$")
+
+
+def words_of(line):
+    """A line split the way the shell would, with its operators as separate words; a line the lexer cannot read
+    (an unclosed quote, as inside a heredoc) falls back to whitespace."""
+    try:
+        lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:
+        return line.split()
+
+
+def program_of(words, raw=False):
+    """(program, the words after it) for one simple command: environment assignments and wrappers such as
+    `timeout 60` or `env X=1` are skipped, and the program is named by its last path component, so that
+    /opt/testbed/bin/pytest is pytest (with raw, the word as written, for context.py to resolve). (None, [])
+    when there is no program."""
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if ASSIGNMENT.match(w):
+            i += 1
+            continue
+        name = w.rsplit("/", 1)[-1]
+        if name in WRAPPERS:
+            i += 1
+            while i < len(words) and (words[i].startswith("-") or ASSIGNMENT.match(words[i])):
+                i += 2 if words[i] in OPTION_ARGS and name in ("xargs", "nice", "sudo", "env", "stdbuf", "timeout") else 1
+            i += WRAPPER_ARGS.get(name, 0)
+            continue
+        return (w if raw else name), words[i + 1:]
+    return None, []
+
+
+def module_of(program, rest):
+    """The module of `python -m module`, after any interpreter options; None for any other command."""
+    if not program or not PYTHON.match(program):
+        return None
+    i = 0
+    while i < len(rest):
+        w = rest[i]
+        if w == "-m":
+            return rest[i + 1] if i + 1 < len(rest) else None
+        if w.startswith("-m") and len(w) > 2:
+            return w[2:]
+        if w in ("-W", "-X"):
+            i += 2
+            continue
+        if not w.startswith("-") or w == "-c":
+            return None
+        i += 1
+    return None
+
+
+def commands_with_args(command, depth=0, raw=False):
+    """(program, module, the words after the program) for each simple command in a shell command line: split at
+    newlines and at the shell's operators, and read into `bash -c '...'`. The word pytest inside a path, a file
+    name, a quoted string or an argument is never a program here, which is what makes the test-runner count a
+    count of invocations."""
+    out = []
+    for line in command.splitlines():
+        cur = []
+        for w in words_of(line) + [";"]:
+            if w and set(w) <= OPERATORS:
+                if cur:
+                    word, rest = program_of(cur, raw=True)
+                    if word:
+                        prog = word.rsplit("/", 1)[-1]
+                        out.append((word if raw else prog, module_of(prog, rest), rest))
+                        if prog in SHELLS and "-c" in rest and depth < 3:
+                            i = rest.index("-c")
+                            if i + 1 < len(rest):
+                                out += commands_with_args(rest[i + 1], depth + 1, raw)
+                cur = []
+            else:
+                cur.append(w)
+    return out
+
+
+def simple_commands(command, depth=0, raw=False):
+    """(program, module) for each simple command in a shell command line (see commands_with_args)."""
+    return [(p, m) for p, m, _rest in commands_with_args(command, depth, raw)]
+
+
+NETWORK_GIT = {"clone", "fetch", "pull", "push"}
+PIP = re.compile(r"^pip(\d+(\.\d+)?)?$")
+
+
+def first_argument(words, takes_value=()):
+    """The first word that is not an option, skipping the value of the options named in takes_value."""
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w in takes_value:
+            i += 2
+        elif w.startswith("-"):
+            i += 1
+        else:
+            return w
+    return None
+
+
+def needs_network(command):
+    """One agent command that cannot work behind the bench's closed network: `pip install` (as pip or as
+    python -m pip, unless it says --no-index) or git with clone, fetch, pull or push. The "commands work" check
+    resolves programs, so it passes pip and git; this count is what it misses."""
+    for prog, module, rest in commands_with_args(command):
+        if module == "pip":
+            rest = rest[rest.index("pip") + 1:] if "pip" in rest else []
+            prog = "pip"
+        if PIP.match(prog or "") and first_argument(rest) == "install" and "--no-index" not in rest:
+            return True
+        if prog == "git" and first_argument(rest, takes_value=("-C", "-c")) in NETWORK_GIT:
+            return True
+    return False
+
+
+def is_test_runner(command):
+    """One agent command that invokes pytest, python -m pytest, py.test or tox as a program."""
+    return any(p in TEST_RUNNERS or m in TEST_RUNNERS for p, m in simple_commands(command))
+
+
+def flagged_name(entry):
+    """A flagged program as context.py check records it: `tox`, or `python3 -m tox` for a module."""
+    return entry.split(" -m ", 1)[1].strip() if " -m " in entry else entry.rsplit("/", 1)[-1]
+
+
+def calls_flagged(command, flagged):
+    """The flagged programs one agent command calls, as a program or as `python -m`."""
+    names = {flagged_name(f) for f in flagged}
+    hit = set()
+    for p, m in simple_commands(command):
+        hit |= names & {p, m}
+    return sorted(hit)
+
+
+def inside_floor(net, floor):
+    """abs(net) <= floor, with a tolerance far below a quarter task so that rounding in the square root cannot
+    decide a tie (a net of exactly the floor is inside it, as the spec words it)."""
+    return abs(net) <= floor + 1e-9
+
+
+def noise_sd(F, a, b):
+    return math.sqrt((F / 2) * (1 / a + 1 / b))
+
+
+def noise_floor(F, a, b):
+    """The size a net between arms of a and b runs must exceed before it counts as a difference."""
+    return NOISE_SDS * noise_sd(F, a, b)
+
+
+def tasks_needed(F, n, a, b, points):
+    """Tasks a bench needs to see a difference of `points` percentage points between arms of a and b runs, at
+    the flip rate f = F/n: N >= NOISE_SDS^2 * (f/2) * (1/a + 1/b) / (points/100)^2."""
+    f = F / n
+    return max(1, math.ceil(NOISE_SDS ** 2 * (f / 2) * (1 / a + 1 / b) / (points / 100) ** 2))
+
+
+def repeats_needed(F, n, points):
+    """Runs per arm, the same number on both sides, for n tasks to see a difference of `points` points."""
+    f = F / n
+    return max(1, math.ceil(NOISE_SDS ** 2 * f / (n * (points / 100) ** 2)))
+
+
+def resolved_of(rows, ids=None):
+    return {r["task_id"]: bool(r["resolved"]) for r in rows if ids is None or r["task_id"] in ids}
+
+
+def flips(a_rows, b_rows, ids=None):
+    """Tasks two single runs disagree on, over the tasks both scored."""
+    a, b = resolved_of(a_rows, ids), resolved_of(b_rows, ids)
+    return sum(a[t] != b[t] for t in set(a) & set(b))
+
+
+HALVES = (((0, 1), (2, 3)), ((0, 2), (1, 3)), ((0, 3), (1, 2)))
+
+
+def restrict(group, ids):
+    return [(rid, [r for r in rows if r["task_id"] in ids]) for rid, rows in group]
+
+
+def noise_figures(none, arms=None, arm_runs=2):
+    """Step 1 of the method: flips for every pairing of the identical runs, their mean F, the nets between the
+    halves of four runs split all three ways, the flips of each context arm's own pair, and the floor for an
+    arm of `arm_runs` runs against all the identical runs, and for two against two. Pure."""
+    pairings = [{"runs": [x[0], y[0]], "flips": flips(x[1], y[1])} for x, y in itertools.combinations(none, 2)]
+    F = sum(p["flips"] for p in pairings) / len(pairings) if pairings else 0.0
+    splits = []
+    if len(none) == 4:
+        for A, B in HALVES:
+            ga, gb = [none[i] for i in A], [none[i] for i in B]
+            p = paired_figures(["half a", "half b"], [ga, gb])
+            splits.append({"a": [rid for rid, _ in ga], "b": [rid for rid, _ in gb], "net": p["net_b_minus_a"]})
+    own = {arm: {"runs": [rid for rid, _ in g], "flips": flips(g[0][1], g[1][1])}
+           for arm, g in (arms or {}).items() if len(g) == 2}
+    b = len(none)
+    return {"runs": [rid for rid, _ in none], "pairings": pairings, "F": F, "splits": splits, "arm_pairs": own,
+            "floor": {"arm_vs_none": {"a": arm_runs, "b": b, "sd": round(noise_sd(F, arm_runs, b), 3),
+                                      "floor": round(noise_floor(F, arm_runs, b), 3),
+                                      "floor_exact": noise_floor(F, arm_runs, b)},
+                      "two_vs_two": {"a": 2, "b": 2, "sd": round(noise_sd(F, 2, 2), 3),
+                                     "floor": round(noise_floor(F, 2, 2), 3), "floor_exact": noise_floor(F, 2, 2)}}}
+
+
+def mean(xs):
+    xs = [x for x in xs if x is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def per_task_mean(group, value, ids):
+    """For each task, the mean over the group's runs of value(row), skipping runs where it is None."""
+    out = {}
+    for t in ids:
+        vals = [value(r) for _rid, rows in group for r in rows if r["task_id"] == t]
+        out[t] = mean(vals)
+    return out
+
+
+def cost_ratios(none, arm, ids):
+    """Per task, the arm's mean cost over the no-file mean cost, for tasks where both are known and the no-file
+    mean is above zero."""
+    a = per_task_mean(none, lambda r: r.get("cost"), ids)
+    b = per_task_mean(arm, lambda r: r.get("cost"), ids)
+    return {t: b[t] / a[t] for t in ids if a[t] and b[t] is not None}, a, b
+
+
+def file_cost_of(usages, api_calls, file_tokens, model_cfg):
+    """What a context file's own tokens cost on one task: the file's tokens times the input price of each call's
+    tier, summed over the calls (this harness caches nothing, so the file is paid for on every call). Without
+    per-call usage, every call is priced at the lower tier."""
+    if str(BENCH / "runner") not in sys.path:
+        sys.path.insert(0, str(BENCH / "runner"))
+    import agent_parts
+    if usages:
+        return sum(file_tokens * agent_parts.input_price_per_token(u, model_cfg) for u in usages)
+    return (api_calls or 0) * file_tokens * agent_parts.per_token(model_cfg["price_per_mtok"])["input"]
+
+
+def first_prompt_tokens(usages):
+    """{task: the prompt tokens of the run's first model call} from {task: [usage per call]}."""
+    if str(BENCH / "runner") not in sys.path:
+        sys.path.insert(0, str(BENCH / "runner"))
+    import agent_parts
+    return {t: agent_parts.prompt_tokens(u[0]) for t, u in usages.items() if u}
+
+
+def measured_file_tokens(arm_first, none_first):
+    """A context file's size as the model counts it: over the arm's runs and tasks, the median of the first
+    call's prompt tokens minus the mean first-call prompt tokens of the no-file runs on the same task. The two
+    prompts differ only by the context block, so the difference is the block. arm_first and none_first are
+    {run id: {task: tokens}}. None when no task has both. Pure."""
+    diffs = []
+    for per in arm_first.values():
+        for t, n in per.items():
+            base = mean([x[t] for x in none_first.values() if t in x])
+            if base is not None:
+                diffs.append(n - base)
+    return median(diffs)
+
+
+def cost_figures(none, arm, ids, file_cost=None):
+    """Cost task by task for one arm against the no-file runs, and the arm's extra cost split in two: the file's
+    own resent tokens (file_cost[rid][task], dollars) and the rest, which is the agent doing more. Pure."""
+    ratios, a, b = cost_ratios(none, arm, ids)
+    both = [t for t in ids if a[t] is not None and b[t] is not None]
+    extra = sum(b[t] - a[t] for t in both)
+    own = None
+    if file_cost is not None:
+        own = sum(mean([file_cost.get(rid, {}).get(t) for rid, _ in arm]) or 0.0 for t in both)
+    med = median(list(ratios.values()))
+    return {"tasks": len(ratios), "ratio_median": round(med, 3) if med is not None else None,
+            "ratio_median_exact": med, "extra_total": round(extra, 4),
+            "file_own_total": round(own, 4) if own is not None else None,
+            "file_own_share_pct": round(100 * own / extra) if own is not None and extra > 0 else None,
+            "remainder_total": round(extra - own, 4) if own is not None else None,
+            "none_mean_total": round(sum(a[t] for t in both), 4), "arm_mean_total": round(sum(b[t] for t in both), 4),
+            "per_task": [{"task_id": t, "none_mean": round(a[t], 4) if a[t] is not None else None,
+                          "arm_mean": round(b[t], 4) if b[t] is not None else None,
+                          "ratio": round(ratios[t], 3) if t in ratios else None} for t in ids]}
+
+
+def split_cost_ratios(none, ids):
+    """The same median ratio between the halves of the four no-file runs, for the three splits, and the largest
+    of them read either way (each ratio or its inverse, whichever is larger)."""
+    out = []
+    for A, B in HALVES:
+        r, _, _ = cost_ratios([none[i] for i in A], [none[i] for i in B], ids)
+        m = median(list(r.values()))
+        out.append({"a": [none[i][0] for i in A], "b": [none[i][0] for i in B],
+                    "ratio_median": round(m, 3) if m is not None else None, "ratio_median_exact": m})
+    largest = max((max(s["ratio_median_exact"], 1 / s["ratio_median_exact"]) for s in out
+                   if s["ratio_median_exact"]), default=None)
+    return out, largest
+
+
+def test_runner_counts(cmds, ids):
+    """Per task, the number of the run's agent commands that invoke a test runner (0 without a trajectory)."""
+    return {t: sum(is_test_runner(c) for c in cmds.get(t, [])) for t in ids}
+
+
+def behaviour_figures(none_ids, arm_ids, cmds, ids, flagged=()):
+    """Test-runner commands per task, the arm's mean minus the no-file mean task by task and its median, and the
+    agent's commands that call a flagged program, per run. cmds[rid][task] is the list of commands. Pure."""
+    counts = {rid: test_runner_counts(cmds.get(rid, {}), ids) for rid in list(none_ids) + list(arm_ids)}
+    na = {t: mean([counts[r][t] for r in none_ids]) for t in ids}
+    aa = {t: mean([counts[r][t] for r in arm_ids]) for t in ids}
+    diffs = [aa[t] - na[t] for t in ids]
+    fl = {}
+    for rid in list(none_ids) + list(arm_ids):
+        per = collections.Counter()
+        n = 0
+        for t in ids:
+            for c in cmds.get(rid, {}).get(t, []):
+                hit = calls_flagged(c, flagged)
+                n += bool(hit)
+                per.update(hit)
+        fl[rid] = {"commands": n, "by_program": dict(sorted(per.items()))}
+    net = {rid: sum(1 for t in ids for c in cmds.get(rid, {}).get(t, []) if needs_network(c))
+           for rid in list(none_ids) + list(arm_ids)}
+    med = median(diffs)
+    return {"none_mean_per_task": round(mean(list(na.values())) or 0, 3),
+            "arm_mean_per_task": round(mean(list(aa.values())) or 0, 3),
+            "none_median_per_task": median(list(na.values())), "arm_median_per_task": median(list(aa.values())),
+            "diff_median": med, "flagged": list(flagged), "flagged_calls": fl, "network_calls": net,
+            "missing_trajectories": {rid: sum(1 for t in ids if t not in cmds.get(rid, {})) for rid in counts},
+            "per_task": [{"task_id": t, "none_mean": na[t], "arm_mean": aa[t]} for t in ids]}
+
+
+DIFF_FILE = re.compile(r"^diff --git a/(\S+) b/", re.M)
+
+
+def diff_paths(diff_text):
+    """The paths a submitted diff touches."""
+    return DIFF_FILE.findall(diff_text or "")
+
+
+def asks_figures(paths, asks, ids):
+    """Did the agent do what the file asked? For each ask (a name and the path prefixes that show it was
+    followed, from the recipe's `context_asks`), the number of tasks per run whose submitted diff touches such a
+    path. paths[rid][task] is the list of paths in that run's diff. A count of diffs, not of intentions: an agent
+    may add a changelog fragment unasked, which is why the no-file runs are counted beside the others. Pure."""
+    def hit(ps, prefixes):
+        return any(p == x or p.startswith(x) for p in ps for x in prefixes)
+    return {name: {rid: sum(1 for t in ids if hit(per.get(t, []), prefixes)) for rid, per in paths.items()}
+            for name, prefixes in asks.items()}
+
+
+def compare_arm(none, arm, ids, cmds):
+    """Net, median per-task cost ratio and median test-runner difference of one arm against no file, on ids."""
+    p = paired_figures(["none", "arm"], [restrict(none, ids), restrict(arm, ids)])
+    ratios, _, _ = cost_ratios(none, arm, ids)
+    b = behaviour_figures([r for r, _ in none], [r for r, _ in arm], cmds, ids)
+    return {"tasks": len(ids), "net": p["net_b_minus_a"], "cost_ratio_median": median(list(ratios.values())),
+            "test_runner_diff_median": b["diff_median"]}
+
+
+def sign(x, around=0.0):
+    return 0 if x is None or x == around else (1 if x > around else -1)
+
+
+def validation_figures(pool, haiku, haiku_verdicts):
+    """The validation pool: for each file, the larger model's figures beside Haiku's on the same tasks, and
+    agree or disagree by the spec's rule: the cost ratio on the same side of 1, the test-runner difference of
+    the same sign, and the net within CONTEXT_VALIDATION_NET of zero where Haiku's verdict was inside its floor,
+    or beyond it with the same sign where it was outside. haiku_verdicts[arm] = (inside, net) from the full
+    bench. Pure."""
+    out = {}
+    for arm, v in pool.items():
+        h = haiku[arm]
+        inside, hnet = haiku_verdicts[arm]
+        if inside:
+            net_ok = abs(v["net"]) <= CONTEXT_VALIDATION_NET
+        else:
+            net_ok = abs(v["net"]) > CONTEXT_VALIDATION_NET and sign(v["net"]) == sign(hnet)
+        out[arm] = {"pool": v, "haiku_same_tasks": h, "haiku_inside_floor": inside, "haiku_net": hnet,
+                    "agree": {"cost": sign(v["cost_ratio_median"], 1.0) == sign(h["cost_ratio_median"], 1.0),
+                              "test_runner": sign(v["test_runner_diff_median"]) == sign(h["test_runner_diff_median"]),
+                              "net": net_ok}}
+    return out
+
+
+def context_predictions(ctx):
+    """The context file study's five predictions, exactly as its spec words them, from the figures alone."""
+    floor = ctx["noise"]["floor"]["arm_vs_none"]["floor_exact"]
+    out = []
+    for n, arm, title in ((1, "project-docs", "The project's own docs are inside the noise"),
+                          (2, "generated", "The generated file is inside the noise too")):
+        if arm in ctx["paired"]:
+            net = ctx["paired"][arm]["net_b_minus_a"]
+            out.append((f"{n}. {title}", inside_floor(net, floor), f"net {net:+g} against a floor of {floor:.2f}"))
+    if "generated" in ctx["cost"]:
+        r = ctx["cost"]["generated"]["ratio_median_exact"]
+        largest = ctx["cost_splits"]["largest"]
+        held = r is not None and r >= CONTEXT_COST_RATIO and (largest is None or r > largest)
+        out.append(("3. The generated file costs more, task by task", held,
+                    f"median ratio {r:.3f}, at least {CONTEXT_COST_RATIO} and above the largest split ratio "
+                    f"{largest:.3f}" if r is not None and largest is not None else f"median ratio {r}, splits {largest}"))
+    diffs = {arm: b["diff_median"] for arm, b in ctx["behaviour"].items()}
+    if diffs:
+        out.append(("4. Context files make the agent test more",
+                    all(d is not None and d >= CONTEXT_TEST_RUNNER_GAIN for d in diffs.values()),
+                    "; ".join(f"{arm}: median difference {d:+g}" for arm, d in diffs.items())))
+    gaps = ctx.get("single_run_gaps") or {}
+    if gaps:
+        def misleads(g):
+            return max(g) - min(g) >= CONTEXT_SINGLE_RUN_SPAN or (min(g) < 0 < max(g))
+        out.append(("5. One run each would have misled", any(misleads(g) for g in gaps.values()),
+                    "; ".join(f"{arm}: gaps {sorted(g)}" for arm, g in gaps.items())))
+    return out
+
+
+def context_figures(data):
+    """Every block of report-context.json from loaded runs, so the tests can feed it hand-written rows. data:
+    n_tasks; labels; none, a list of (run id, rows); arms, {arm: [(run id, rows)]}; cmds, {run id: {task:
+    [commands]}}; file_cost, {run id: {task: dollars}}; flagged, {arm: [programs]}; pool, {arm: (run id, rows)};
+    pool_base, [(run id, rows)]; and, when a training data cutoff applies, merged_at and cutoff. Pure."""
+    none, arms, labels, cmds = data["none"], data["arms"], data.get("labels") or {}, data.get("cmds") or {}
+    ids = sorted(set.intersection(*[{r["task_id"] for r in rows} for _rid, rows in none + [g for a in arms.values() for g in a]]))
+    n1 = none[0]
+    k = sum(r["resolved"] for r in n1[1])
+    ctx = {"tasks": len(ids),
+           "pilot": {"run": n1[0], "resolved": k, "tasks": len(n1[1]), "threshold": CONTEXT_PILOT_MIN,
+                     "passed": k >= CONTEXT_PILOT_MIN},
+           "noise": noise_figures(none, arms, arm_runs=2), "paired": {}, "cost": {}, "behaviour": {},
+           "single_run_gaps": {}}
+    F = ctx["noise"]["F"]
+    flagged_all = sorted({f for fs in (data.get("flagged") or {}).values() for f in fs})
+    none_ids = [rid for rid, _ in none]
+    for arm, group in arms.items():
+        p = paired_figures(["none", arm], [restrict(none, ids), restrict(group, ids)], labels)
+        allr = [resolved_of(rows, ids) for _rid, rows in none + group]
+        p["tasks_apart"] = sum(1 for t in ids if 0 < sum(r[t] for r in allr) < len(allr))
+        if data.get("cutoff") and data.get("merged_at"):
+            for side, keep in (("before_cutoff", lambda d: d < data["cutoff"]), ("from_cutoff", lambda d: d >= data["cutoff"])):
+                sub = {t for t in ids if keep(data["merged_at"][t][:10])}
+                if sub:
+                    q = paired_figures(["none", arm], [restrict(none, sub), restrict(group, sub)])
+                    p[side] = {k2: q[k2] for k2 in ("tasks", "both", "neither", "only_a", "only_b", "net_b_minus_a")}
+        ctx["paired"][arm] = p
+        ctx["cost"][arm] = cost_figures(none, group, ids, data.get("file_cost"))
+        if data.get("file_cost_estimate") is not None:  # the same split with the file sized at 4 characters a token
+            est = cost_figures(none, group, ids, data["file_cost_estimate"])
+            ctx["cost"][arm]["file_own_total_estimate"] = est["file_own_total"]
+        ctx["behaviour"][arm] = behaviour_figures(none_ids, [rid for rid, _ in group], cmds, ids,
+                                                  flagged_all)
+        ctx["single_run_gaps"][arm] = [sum(resolved_of(g, ids).values()) - sum(resolved_of(x, ids).values())
+                                       for _ga, g in group for _xa, x in none]
+    splits, largest = split_cost_ratios(none, ids) if len(none) == 4 else ([], None)
+    ctx["cost_splits"] = {"splits": splits, "largest": largest}
+    n = len(ids)
+    fl = noise_floor(F, 2, len(none))
+    ctx["detectable"] = {"floor_tasks": round(fl, 2), "floor_points": round(100 * fl / n, 1) if n else None,
+                         "tasks_needed": {str(x): tasks_needed(F, n, 2, len(none), x) for x in CONTEXT_POINTS} if n else {},
+                         "repeats_needed_per_arm": {str(x): repeats_needed(F, n, x) for x in CONTEXT_POINTS} if n else {},
+                         "a": 2, "b": len(none), "F": F}
+    ctx["predictions"] = [{"name": nm, "verdict": "held" if held else "failed", "detail": d}
+                          for nm, held, d in context_predictions(ctx)]
+    if data.get("asks") and data.get("diff_paths"):
+        fair_ids = sorted(t for t in ids if labels.get(t) == CONTEXT_POOL_LABEL)
+        main = [rid for rid, _ in none] + [rid for g in arms.values() for rid, _ in g]
+        pool_ids = [rid for rid, _ in data.get("pool_base") or []] + [rid for rid, _ in (data.get("pool") or {}).values()]
+        dp = data["diff_paths"]
+        ctx["asks"] = {"all_tasks": asks_figures({r: dp.get(r, {}) for r in main}, data["asks"], ids),
+                       "pool_tasks": asks_figures({r: dp.get(r, {}) for r in main + pool_ids}, data["asks"], fair_ids),
+                       "tasks": len(ids), "pool_task_count": len(fair_ids)}
+    if data.get("pool"):
+        fair = sorted(t for t in ids if labels.get(t) == CONTEXT_POOL_LABEL)
+        pool, haiku, verdicts = {}, {}, {}
+        for arm, (rid, rows) in data["pool"].items():
+            pool[arm] = {"run": rid, "against": [r for r, _ in data["pool_base"]],
+                         **compare_arm(data["pool_base"], [(rid, rows)], fair, cmds)}
+            haiku[arm] = compare_arm(none, arms[arm], fair, cmds)
+            verdicts[arm] = (inside_floor(ctx["paired"][arm]["net_b_minus_a"], ctx["noise"]["floor"]["arm_vs_none"]["floor_exact"]),
+                             ctx["paired"][arm]["net_b_minus_a"])
+        ctx["validation"] = {"label": CONTEXT_POOL_LABEL, "tasks": len(fair), "rule_net": CONTEXT_VALIDATION_NET,
+                             "arms": validation_figures(pool, haiku, verdicts)}
+    return ctx
+
+
+def read_text_or_empty(path):
+    path = Path(path)
+    return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+
+def run_settings(run_dir):
+    f = Path(run_dir) / "settings.json"
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else None
+
+
+def pairing_problem(settings, tasks, subset=None):
+    """Why a set of runs cannot be read side by side, or None: their settings name different models, or they
+    were made over different task sets and no subset was named (with one, every run must hold all of it).
+    settings[rid] is the run's settings.json or None (an old run: not checked); tasks[rid] its scored task ids."""
+    models = {rid: (s or {}).get("harness", {}).get("model", {}).get("model_name") for rid, s in settings.items()}
+    known = {m for m in models.values() if m}
+    if len(known) > 1:
+        return f"the runs name different models: {models}"
+    sets = {frozenset(v) for v in tasks.values()}
+    if subset is not None:
+        short = {rid: len(set(subset) - set(v)) for rid, v in tasks.items() if set(subset) - set(v)}
+        return f"runs lack tasks of the subset: {short}" if short else None
+    if len(sets) > 1:
+        return (f"the runs cover different task sets ({ {rid: len(v) for rid, v in tasks.items()} } tasks); name the "
+                "subset to read with --label")
+    return None
+
+
+def load_run_data(kd, rid):
+    """Scored rows, settings, agent commands and per-call usage for one run, from its folder."""
+    rd = Path(kd) / "runs" / rid
+    if not (rd / "score.jsonl").exists():
+        sys.exit(f"run {rid} has no score.jsonl; score it first")
+    rows = read_jsonl(rd / "score.jsonl")
+    cmds, usages = {}, {}
+    for r in rows:
+        f = rd / r["task_id"] / "trajectory.json"
+        if f.exists():
+            tr = json.loads(f.read_text(encoding="utf-8"))
+            cmds[r["task_id"]], usages[r["task_id"]] = agent_commands(tr), call_usages(tr)
+    return rows, run_settings(rd), cmds, usages
+
+
+def context_lines(ctx, files):
+    """report-context.md, block by block, from the figures alone."""
+    nz = ctx["noise"]
+    L = ["# Context file study report", "", f"Tasks read: {ctx['tasks']}.", "", "## Files", ""]
+    for arm, f in files.items():
+        L.append(f"- {arm}: {f.get('lines')} lines, about {f.get('tokens_estimate')} tokens by estimate and "
+                 f"{f.get('tokens_measured')} measured from the first call, sha256 "
+                 f"{(f.get('sha256') or '')[:16]}; programs flagged: {', '.join(f.get('flagged') or []) or 'none'}; "
+                 f"statements against the harness prompt: {f.get('contradictions')}")
+    p = ctx["pilot"]
+    L += ["", "## Pilot gate", "", f"{p['run']} resolved {p['resolved']} of {p['tasks']}; threshold {p['threshold']}: "
+          f"{'passed' if p['passed'] else 'NOT passed'}.", "", "## Noise", "",
+          "| pairing | flips |", "|---|---|"]
+    L += [f"| {' / '.join(x['runs'])} | {x['flips']} |" for x in nz["pairings"]]
+    L += [f"| {arm} ({' / '.join(x['runs'])}) | {x['flips']} |" for arm, x in nz["arm_pairs"].items()]
+    fa, f2 = nz["floor"]["arm_vs_none"], nz["floor"]["two_vs_two"]
+    L += ["", f"Mean flips F over the no-file pairings: {nz['F']:.2f}. Split nets: "
+          + ", ".join(f"{'+'.join(s['b'])} against {'+'.join(s['a'])} {s['net']:+g}" for s in nz["splits"]) + ".",
+          f"Noise floor, {fa['a']} runs against {fa['b']}: {fa['floor_exact']:.2f} tasks (sd {fa['sd']:.2f}); two against "
+          f"two: {f2['floor_exact']:.2f}.", "", "## Paired, each arm against no file", "",
+          "| arm | tasks | n | both | neither | only none | only arm | net | apart |", "|---|---|---|---|---|---|---|---|---|"]
+    for arm, q in ctx["paired"].items():
+        for name in ("all", "fair", "unfair", "unclear", "before_cutoff", "from_cutoff"):
+            c = q if name == "all" else q.get(name)
+            if c:
+                L.append(f"| {arm} | {name} | {c['tasks']} | {c['both']:g} | {c['neither']:g} | {c['only_a']:g} | "
+                         f"{c['only_b']:g} | {c['net_b_minus_a']:+g} | {q['tasks_apart'] if name == 'all' else ''} |")
+    L += ["", "| run | resolved | total | per resolved | median per task | calls median | capped |", "|---|---|---|---|---|---|---|"]
+    seen = set()
+    for q in ctx["paired"].values():
+        for rid, f in q["runs"].items():
+            if rid in seen:
+                continue
+            seen.add(rid)
+            per = f"${f['cost_per_resolved']:.3f}" if f["cost_per_resolved"] is not None else "n/a"
+            L.append(f"| {rid} | {f['resolved']} of {f['tasks']} | ${f['cost_total']:.2f} | {per} | ${f['cost_median']:.3f} | "
+                     f"{f['calls_median']} | {f['capped']} |")
+    L += ["", "## Cost, task by task", ""]
+    for arm, c in ctx["cost"].items():
+        own = "n/a" if c["file_own_total"] is None else f"${c['file_own_total']:.4f}"
+        rest = "n/a" if c["remainder_total"] is None else f"${c['remainder_total']:.4f}"
+        L.append(f"- {arm}: median per-task ratio {c['ratio_median']} over {c['tasks']} tasks; extra ${c['extra_total']:.4f} "
+                 f"in all, of which the file's own tokens {own} and the rest {rest}"
+                 + (f" (the file's own tokens by the four-characters estimate: ${c['file_own_total_estimate']:.4f})"
+                    if c.get("file_own_total_estimate") is not None else ""))
+    L.append("- no-file halves: " + ", ".join(f"{'+'.join(s['b'])} over {'+'.join(s['a'])} {s['ratio_median']}"
+                                            for s in ctx["cost_splits"]["splits"])
+             + f"; largest either way {ctx['cost_splits']['largest']}")
+    L += ["", "## Behaviour", ""]
+    for arm, b in ctx["behaviour"].items():
+        L.append(f"- {arm}: test-runner commands per task, mean {b['arm_mean_per_task']} against {b['none_mean_per_task']} "
+                 f"with no file; median difference task by task {b['diff_median']:+g}; commands calling a flagged "
+                 f"program: " + ", ".join(f"{rid} {v['commands']}" for rid, v in b["flagged_calls"].items())
+                 + "; commands that need the network: "
+                 + ", ".join(f"{rid} {n}" for rid, n in b.get("network_calls", {}).items()))
+    if ctx.get("asks"):
+        a = ctx["asks"]
+        L += ["", "## Did the agent do what the files ask?", "",
+              f"Tasks whose submitted diff shows the ask, per run, of {a['tasks']} tasks:", ""]
+        for name, per in a["all_tasks"].items():
+            L.append(f"- {name}: " + ", ".join(f"{rid} {n}" for rid, n in per.items()))
+        L += ["", f"On the pool's {a['pool_task_count']} tasks, the pool's runs included:", ""]
+        for name, per in a["pool_tasks"].items():
+            L.append(f"- {name}: " + ", ".join(f"{rid} {n}" for rid, n in per.items()))
+    d = ctx["detectable"]
+    L += ["", "## What this bench can see", "",
+          f"Smallest net above the floor: {d['floor_tasks']:.2f} tasks, {d['floor_points']} points of resolved rate.",
+          "Tasks needed (2 runs against 4): " + ", ".join(f"{x} points {n}" for x, n in d["tasks_needed"].items())
+          + ". Repeats per arm on these tasks: " + ", ".join(f"{x} points {n}" for x, n in d["repeats_needed_per_arm"].items()) + "."]
+    if ctx.get("validation"):
+        v = ctx["validation"]
+        L += ["", f"## Validation pool ({v['tasks']} {v['label']} tasks)", "",
+              "| file | figure | pool | Haiku, same tasks | agree |", "|---|---|---|---|---|"]
+        for arm, a in v["arms"].items():
+            for key, fig in (("net", "net"), ("cost", "cost_ratio_median"), ("test_runner", "test_runner_diff_median")):
+                L.append(f"| {arm} | {fig} | {a['pool'][fig]} | {a['haiku_same_tasks'][fig]} | "
+                         f"{'agree' if a['agree'][key] else 'disagree'} |")
+    L += ["", "## Predictions", ""]
+    L += [f"- {x['name']}: {x['verdict'].upper()} ({x['detail']})" for x in ctx["predictions"]]
+    return L
+
+
+def context_report(args, recipe, kd, labels):
+    """report --study context: load the ten Haiku and pool runs and the two frozen files, check that they may be
+    read side by side, and write report-context.md and report-context.json."""
+    manifest = json.loads((kd / "tasks.json").read_text(encoding="utf-8"))
+    loaded = {}
+    every = list(CONTEXT_NONE_RUNS) + [r for g in CONTEXT_ARMS.values() for r in g] + list(CONTEXT_POOL.values()) \
+        + list(CONTEXT_POOL_BASE)
+    for rid in every:
+        loaded[rid] = load_run_data(kd, rid)
+    files, flagged = {}, {}
+    for arm in CONTEXT_ARMS:
+        try:
+            doc = load_context(kd, arm, manifest)
+        except ValueError as e:
+            sys.exit(str(e))
+        chk = doc.get("check") or {}
+        flagged[arm] = chk.get("flagged_programs") or []
+        files[arm] = {"sha256": doc["sha256"], "lines": doc.get("lines"), "tokens_estimate": doc.get("tokens_estimate"),
+                      "flagged": flagged[arm], "contradictions": len(chk.get("contradictions") or []),
+                      "source": doc.get("source")}
+    for rid in every:
+        s = loaded[rid][1] or {}
+        want = "none"
+        for arm, g in CONTEXT_ARMS.items():
+            if rid in g or CONTEXT_POOL.get(arm) == rid:
+                want = arm
+        have = s.get("context", {"name": "none"})
+        if have.get("name") != want or (want != "none" and have.get("sha256") != files[want]["sha256"]):
+            sys.exit(f"run {rid} was made with context file {have}, not {want} as frozen")
+    haiku = list(CONTEXT_NONE_RUNS) + [r for g in CONTEXT_ARMS.values() for r in g]
+    why = pairing_problem({r: loaded[r][1] for r in haiku}, {r: {x["task_id"] for x in loaded[r][0]} for r in haiku})
+    fair = {t for t, v in labels.items() if v == CONTEXT_POOL_LABEL}
+    pool_runs = list(CONTEXT_POOL.values()) + list(CONTEXT_POOL_BASE)
+    why = why or pairing_problem({r: loaded[r][1] for r in pool_runs},
+                                 {r: {x["task_id"] for x in loaded[r][0]} for r in pool_runs}, subset=fair)
+    if why:
+        sys.exit(why)
+    file_cost, file_cost_estimate = {}, {}
+    none_first = {r: first_prompt_tokens(loaded[r][3]) for r in CONTEXT_NONE_RUNS}
+    for arm, g in CONTEXT_ARMS.items():
+        estimate = files[arm]["tokens_estimate"] or 0
+        measured = measured_file_tokens({r: first_prompt_tokens(loaded[r][3]) for r in g}, none_first)
+        files[arm]["tokens_measured"] = measured
+        for rid in g:
+            rows, s, _c, usages = loaded[rid]
+            model = s["harness"]["model"]
+            for tokens, into in ((estimate if measured is None else measured, file_cost), (estimate, file_cost_estimate)):
+                into[rid] = {r["task_id"]: file_cost_of(usages.get(r["task_id"]), r.get("api_calls"), tokens, model)
+                             for r in rows}
+    data = {"n_tasks": len(manifest["tasks"]), "labels": labels,
+            "none": [(r, loaded[r][0]) for r in CONTEXT_NONE_RUNS],
+            "arms": {arm: [(r, loaded[r][0]) for r in g] for arm, g in CONTEXT_ARMS.items()},
+            "cmds": {r: loaded[r][2] for r in every}, "file_cost": file_cost,
+            "file_cost_estimate": file_cost_estimate, "flagged": flagged,
+            "asks": recipe.get("context_asks") or {},
+            "diff_paths": {rid: {r["task_id"]: diff_paths(read_text_or_empty(kd / "runs" / rid / r["task_id"] / "submission.diff"))
+                                 for r in loaded[rid][0]} for rid in every},
+            "pool": {arm: (rid, loaded[rid][0]) for arm, rid in CONTEXT_POOL.items()},
+            "pool_base": [(r, loaded[r][0]) for r in CONTEXT_POOL_BASE],
+            "merged_at": {t["task_id"]: t["merged_at"] for t in manifest["tasks"]},
+            "cutoff": getattr(args, "training_cutoff", None)}
+    ctx = context_figures(data)
+    out = Path(args.out) if args.out else kd / "report-context.md"
+    out.write_text("\n".join(context_lines(ctx, files)) + "\n", encoding="utf-8")
+    fig = {"repo": recipe["repo"], "written": time.strftime("%Y-%m-%dT%H:%M:%S"), "study": "context",
+           "tasks_checksum": manifest["checksum"], "files": files, "training_cutoff": data["cutoff"], **ctx}
+    out_json = out.with_suffix(".json")
+    out_json.write_text(json.dumps(fig, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print("\n".join(f"{p['name']}: {p['verdict'].upper()} ({p['detail']})" for p in ctx["predictions"]))
+    print(f"wrote {out} and {out_json}")
+
+
+def noise_lines(nz):
+    fa, f2 = nz["floor"]["arm_vs_none"], nz["floor"]["two_vs_two"]
+    L = ["## Noise", "", "| pairing | flips |", "|---|---|"]
+    L += [f"| {' / '.join(x['runs'])} | {x['flips']} |" for x in nz["pairings"]]
+    L += ["", f"Mean flips F: {nz['F']:.2f}. Split nets: "
+          + (", ".join(f"{'+'.join(s['b'])} against {'+'.join(s['a'])} {s['net']:+g}" for s in nz["splits"]) or "none (needs four runs)")
+          + f". Noise floor, two runs against two: {f2['floor_exact']:.2f} tasks; {fa['a']} against {fa['b']}: "
+          f"{fa['floor_exact']:.2f}.", ""]
+    return L
 
 
 # ---------------------------------------------------------------------------- all
@@ -1052,6 +1898,10 @@ def main(argv=None):
     p.add_argument("--only", help="comma-separated task ids")
     p.add_argument("--tickets", help="hand the agent a frozen version of the tickets (tickets.py), e.g. rewritten; "
                                      "default the issue as filed")
+    p.add_argument("--harness", help="harness settings file; default bench/harness.json (e.g. bench/harness.haiku.json)")
+    p.add_argument("--context", help="place a frozen context file (context.py freeze), e.g. project-docs, in its own "
+                                     "block ahead of the ticket; default none")
+    p.add_argument("--label", help="run only the tasks with this fairness label (fairness/labels.jsonl), e.g. fair")
     p.set_defaults(func=run_agent)
 
     p = sub.add_parser("score", help="score a run with the withheld tests")
@@ -1072,8 +1922,14 @@ def main(argv=None):
     p.add_argument("--out")
     p.add_argument("--paired", nargs=2, action="append", metavar=("A1,A2", "B1,B2"),
                    help="two groups of run ids, one version of the tickets each, read pair by pair; may repeat")
-    p.add_argument("--study", choices=["bench", "tickets"], default="bench",
-                   help="which study's predictions to report (default bench, the third post's)")
+    p.add_argument("--study", choices=["bench", "tickets", "context"], default="bench",
+                   help="which study's predictions to report (default bench, the third post's); context writes "
+                        "report-context.md and .json from the runs named at the top of bench.py")
+    p.add_argument("--noise", metavar="R1,R2,...", help="identical runs: flips of every pairing, split nets, noise floor")
+    p.add_argument("--label", help="read only the tasks with this fairness label (needs --labels), e.g. when runs "
+                                   "cover different task sets")
+    p.add_argument("--training-cutoff", metavar="YYYY-MM-DD",
+                   help="context study: report the tasks merged before this date separately")
     p.set_defaults(func=report)
 
     p = sub.add_parser("verdict", help="the predictions alone")

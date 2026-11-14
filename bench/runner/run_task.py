@@ -9,6 +9,12 @@ model, through the bench-egress proxy, the only way out of the container's netwo
 
 Writes /out/trajectory.json (the harness's own record), /out/submission.diff (every change in the working tree
 against the base commit, without the harness's patch.txt), /out/result.json and /out/harness.log.
+
+Two additions for the context file study, both off unless meta.json asks for them, so a run without them gets
+the same prompt as before: `context` (a frozen context file in /task, placed in its own block ahead of the
+ticket by agent_parts.compose_instance_template and handed to the template as a variable) and `task_text` with
+`collect` (context.py generate: the initialisation prompt as the task, and the files the agent wrote copied to
+/out/collected). Cost is counted per call at the price tier of that call's prompt length (agent_parts.call_cost).
 """
 import json
 import os
@@ -19,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, "/runner")
 import inside  # noqa: E402
+import agent_parts  # noqa: E402
 
 CFG = json.loads(Path("/bench/harness.json").read_text(encoding="utf-8"))
 META = json.loads(Path("/task/meta.json").read_text(encoding="utf-8"))
@@ -34,8 +41,6 @@ from minisweagent.agents.default import DefaultAgent  # noqa: E402
 from minisweagent.config import get_config_path  # noqa: E402
 from minisweagent.environments.local import LocalEnvironment  # noqa: E402
 from minisweagent.models.litellm_model import LitellmModel  # noqa: E402
-
-PRICE = {k: v / 1e6 for k, v in CFG["model"]["price_per_mtok"].items()}
 
 
 class AgentUserEnvironment(LocalEnvironment):
@@ -66,11 +71,12 @@ def usage_of(response):
 
 class GatewayModel(LitellmModel):
     """LiteLLM has no price for a model reached through the gateway's OpenAI-compatible endpoint, so cost is
-    counted here from the usage the gateway reports, at the list prices in harness.json."""
+    counted here from the usage the gateway reports, at the list prices in harness.json (the higher tier for a
+    call whose prompt passes the tier's threshold, when the settings file has one)."""
 
     def _calculate_cost(self, response):
         u = usage_of(response)
-        return {"cost": sum(u[k] * PRICE[k] for k in u), "usage": u}
+        return {"cost": agent_parts.call_cost(u, CFG["model"]), "usage": u}
 
     def serialize(self):
         """The harness saves its model settings in the trajectory; the key is passed in them, so it is removed."""
@@ -99,9 +105,16 @@ def main():
         mcfg["model_kwargs"] = {**mcfg.get("model_kwargs", {}), "api_base": CFG["model"]["api_base"],
                                 "api_key": key}
         model = GatewayModel(model_name=CFG["model"]["model_name"], cost_tracking="ignore_errors", **mcfg)
+        extra_vars = {}
+        if META.get("context"):  # the frozen file, as a variable: never pasted into the template
+            agent_cfg["instance_template"] = agent_parts.compose_instance_template(agent_cfg["instance_template"])
+            extra_vars[agent_parts.CONTEXT_VAR] = Path(META["context"]["path"]).read_text(encoding="utf-8")
         agent = DefaultAgent(model, env, **agent_cfg)
-        task = CFG["task_preamble"].format(repo=META["repo"]) + "\n\n" + META["issue_title"] + "\n\n" + META["issue_body"]
-        out = agent.run(task=task)
+        if META.get("task_text") is not None:
+            task = META["task_text"]
+        else:
+            task = CFG["task_preamble"].format(repo=META["repo"]) + "\n\n" + META["issue_title"] + "\n\n" + META["issue_body"]
+        out = agent.run(task=task, **extra_vars)
         result.update(exit_status=out.get("exit_status", ""), cost=agent.cost, api_calls=agent.n_calls)
         tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
         for m in agent.messages:
@@ -124,6 +137,11 @@ def main():
             diff = ""
             result["diff_error"] = repr(e)[:500]
         (OUT / "submission.diff").write_text(diff, encoding="utf-8")
+        for name in META.get("collect") or []:  # read as root: the agent user cannot write to /out
+            src = inside.TESTBED / name
+            if src.is_file():
+                (OUT / "collected").mkdir(exist_ok=True)
+                (OUT / "collected" / name).write_bytes(src.read_bytes())
         result.update(submission_bytes=len(diff.encode()), wall_s=round(time.time() - t0, 1),
                       capped=result.get("exit_status") == "LimitsExceeded")
         (OUT / "result.json").write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")

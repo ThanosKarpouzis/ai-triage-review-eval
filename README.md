@@ -29,6 +29,8 @@ A seventh tool, [`bench.py`](#build-a-test-bench-from-your-own-fixed-issues), tu
 
 An eighth tool, [`tickets.py`](#vary-the-ticket-not-the-setup), prices the wording of a ticket on that bench: the title alone, the ticket as filed, and the ticket rewritten with acceptance criteria by a published rule that a leak check verifies, run in pairs over the same tasks. It is written up in [Does a better ticket beat a better setup?](https://thanoskarpouzis.com/writing/2026/ticket-wording/).
 
+A ninth tool, [`context.py`](#measure-your-noise-before-you-compare-setups), asks whether a setting such as a repository context file (AGENTS.md, CLAUDE.md) changes anything on that bench, after first measuring how far identical runs of your setup differ. It is written up in [Is your context file doing anything?](https://thanoskarpouzis.com/writing/2026/context-file/).
+
 ## What you need
 
 - Python 3. The scripts use the standard library only, so there is nothing to install. The one exception is `prep_aidev.py`, which converts a public dataset once and needs `pyarrow`.
@@ -258,7 +260,7 @@ python3 bench.py all --recipe bench/recipes/OWNER__REPO.json --repo-dir path/to/
 
 This is a checklist, not a ranking; capabilities change between releases, so check again before you choose. One lesson from building this: mini-swe-agent writes its model settings into its trajectory file, so a key passed in those settings ends up on disk. The run step removes it there and scans every file a task leaves behind for the key.
 
-**Limits.** The bench measures what the tests check: resolved means the tests pass, not that the code is good or easy to review. At a few dozen tasks the uncertainty is in which tasks you picked more than in which run you got, so compare setups task by task on the same frozen set. A repository whose tests need a compiled core, services or network access needs a richer recipe than a plain container.
+**Limits.** The bench measures what the tests check: resolved means the tests pass, not that the code is good or easy to review. At a few dozen tasks, compare setups task by task on the same frozen set, and measure how far identical runs differ before you read a difference between two setups ([below](#measure-your-noise-before-you-compare-setups)); one pair of runs is not enough to know. A repository whose tests need a compiled core, services or network access needs a richer recipe than a plain container.
 
 ## Vary the ticket, not the setup
 
@@ -278,6 +280,25 @@ python3 bench.py report --recipe bench/recipes/OWNER__REPO.json --paired r1,r2 t
 ```
 
 `freeze` writes `tickets/rewritten.json` with the rule's checksum, the task set's checksum and its own, and refuses if any task is missing or any final ticket fails the check. `run --tickets` checks the version file against the frozen manifest, hands its title and body to the agent in place of the issue, and records the version and checksum in the run's `settings.json`. `report --paired` reads two runs of each version pair by pair over the same tasks: per task a version scores 1 when resolved in both runs and a half in one of two; the report gives both, neither, only one each way and the net, the same split by the fairness labels, cost per resolved task and the interval on each run, and with `--study tickets` the five predictions of the fourth post. `python3 -m unittest tests/test_tickets.py` covers the versions, the leak check, the rewriter with a fake model, the version check in `run` and the paired figures, with no Docker and no model calls. On pytest, a round of 44 rewrites cost about $1 and eight minutes, and each run of 44 tasks $8 to $10.
+
+## Measure your noise before you compare setups
+
+Before two setups are compared, the one you have is run several times and the report says how far identical runs differ. `report --noise` takes run ids of the same setup over the same tasks and writes, to `report-noise.md` unless `--out` says otherwise, the flips (tasks two runs disagree on) for every pairing, their mean F, the nets between the halves when there are four runs, and the noise floor: two standard deviations of a net between settings when nothing differs, `2 * sqrt((F/2) * (1/a + 1/b))` for a runs against b. With two runs a side that is the square root of twice the flips. A net inside the floor is not a difference.
+
+`context.py` makes the setting under test, a context file, and checks it before a run may use it. `docs` cuts one section out of the project's own contributor documentation at the oldest frozen task's base commit, unedited. `generate` runs one harness session in the bench container at that commit with [`bench/context_init_prompt.md`](bench/context_init_prompt.md) as the task and keeps the `AGENTS.md` the agent writes; the file it wrote for pytest is in [`examples/pytest-generated-AGENTS.md`](examples/pytest-generated-AGENTS.md). `check` runs a leak check (a code-like token that occurs in a withheld test or fix and nowhere in the checkout) and a "commands work" check, which looks up every program the file names inside the bench container without running it and lists the missing ones for you to confirm; it also lists the lines that ask for something the harness's own prompt rules out. The check resolves programs, so it passes `pip` and `git` even where their network commands cannot work. `freeze` records the file's checksum and the verdicts, and refuses a file that leaks or changed since its check.
+
+```sh
+python3 bench.py report --recipe bench/recipes/OWNER__REPO.json --noise n1,n2,n3,n4
+python3 context.py docs --recipe bench/recipes/OWNER__REPO.json
+export AI_GATEWAY_API_KEY=paste-your-key
+python3 context.py generate --recipe bench/recipes/OWNER__REPO.json
+python3 context.py check --recipe bench/recipes/OWNER__REPO.json --name generated
+python3 context.py freeze --recipe bench/recipes/OWNER__REPO.json --name generated --confirmed ""
+python3 bench.py run --recipe bench/recipes/OWNER__REPO.json --context generated --run-id g1 --spend-cap 25
+python3 bench.py report --recipe bench/recipes/OWNER__REPO.json --study context --labels labels.jsonl
+```
+
+`run --context` places the frozen file in its own block ahead of the ticket, labelled as the AGENTS.md at the repository root, records its name and checksum in the run's `settings.json`, and leaves the prompt byte for byte unchanged when no file is given. `run --harness` takes another settings file, such as [`bench/harness.haiku.json`](bench/harness.haiku.json) for a smaller model with its two price tiers, and `run --label fair` runs only the tasks with that fairness label. `report --study context` reads the runs named at the top of `bench.py` (four without a file, two per file, and an optional single-run check on a second model) and writes `report-context.md` and `report-context.json`: the flips and the floor, each file's net against no file with the fair and unfair split, cost task by task with the extra split into the file's own tokens (measured from the first call) and the rest, test-runner commands per task, commands that call a missing program or need the network, how often the things the file asks for show up in the submitted changes (the paths are `context_asks` in the recipe), the smallest difference the bench can show with the tasks or repeats a smaller one would take, and the five predictions of the fifth post. `python3 -m unittest tests/test_context.py` covers all of it with no model calls; five tests need Docker and the bench image and skip without them. On pytest with a small model, a run of 44 tasks cost $0.63 to $0.88 and took about fifty minutes to an hour.
 
 ## Reproduce the public benchmarks
 

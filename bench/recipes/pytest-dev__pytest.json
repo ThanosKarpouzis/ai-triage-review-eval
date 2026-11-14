@@ -14,5 +14,6 @@
   "env": {"SETUPTOOLS_SCM_PRETEND_VERSION": "9.1.0.dev0"},
   "pytest_args": ["-p", "no:cacheprovider", "-q"],
   "timeout_s": 600,
+  "context_asks": {"changelog fragment": ["changelog/"], "AUTHORS line": ["AUTHORS"], "tests": ["testing/"]},
   "docker": {"cpus": "4", "memory": "4g"}
 }

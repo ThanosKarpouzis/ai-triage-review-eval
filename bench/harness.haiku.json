@@ -1,0 +1,39 @@
+{
+  "_notes": "The settings of bench/harness.json with three differences, for the context file study (post 5): the model is Claude Haiku 5.5, the per-task cost limit is $0.05 (the token equivalent of the $1 used with Sonnet 5.5), and prices come in two tiers by prompt length. Select it with `bench.py run --harness bench/harness.haiku.json`; without the flag the run step reads bench/harness.json as before. Everything else is held fixed: harness, prompt, tools, step limit, network, agent user, wall time. No temperature is set, as for the earlier runs. Prices are Anthropic's list prices per million tokens (read 14 November 2026): `price_per_mtok` for prompts up to 100,000 tokens and `long_prompt` above that, where a request's prompt length counts all of its input tokens, cached ones included, and each request is priced on its own (runner/agent_parts.py). The model name follows the Sonnet entry's pattern; the first one-task run confirms the gateway accepts it.",
+  "harness": "mini-swe-agent",
+  "harness_version": "2.4.6",
+  "base_config": "swebench.yaml",
+  "agent": {
+    "cost_limit": 0.05,
+    "step_limit": 75
+  },
+  "environment": {
+    "network": "bench-internal",
+    "proxy": "http://bench-egress:3128",
+    "agent_user": "agent",
+    "cwd": "/testbed",
+    "timeout": 120
+  },
+  "model": {
+    "model_name": "openai/anthropic/claude-haiku-5-5",
+    "api_base": "https://ai-gateway.vercel.sh/v1",
+    "api_key_env": "AI_GATEWAY_API_KEY",
+    "price_per_mtok": {
+      "input": 0.1,
+      "output": 0.5,
+      "cache_read": 0.01,
+      "cache_write": 0.125
+    },
+    "long_prompt": {
+      "above_prompt_tokens": 100000,
+      "price_per_mtok": {
+        "input": 0.5,
+        "output": 2.5,
+        "cache_read": 0.05,
+        "cache_write": 0.625
+      }
+    }
+  },
+  "task_preamble": "The repository {repo} is checked out in /testbed at the commit before this issue was fixed. Fix the issue below in the working tree.",
+  "wall_time_limit_s": 2700
+}
